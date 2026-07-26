@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,6 +87,11 @@ def tools_mode() -> str:
 
 def llm_mode() -> str:
     return "mock" if os.environ.get("JACVERIFY_MOCK_LLM", "1") == "1" else "live"
+
+
+def llm_backend() -> str:
+    """Select the live inference adapter without affecting deterministic mock mode."""
+    return os.environ.get("JACVERIFY_LLM_BACKEND", "firecrawl").strip().lower()
 
 
 def _tool_error(
@@ -570,8 +577,51 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
     )
 
 
-def run_reverify(workspace_root: str, output_dir: str) -> ToolResult:
+def run_reverify(
+    workspace_root: str,
+    output_dir: str,
+    attempt: int = 1,
+) -> ToolResult:
     if tools_mode() == "mock":
+        sequence_raw = os.environ.get("JACVERIFY_REVERIFY_SEQUENCE", "").strip()
+        if sequence_raw:
+            sequence = [
+                item.strip().upper()
+                for item in sequence_raw.split(",")
+                if item.strip()
+            ]
+            if not sequence:
+                return _tool_error(
+                    tool="mock:vvp",
+                    mode="mock",
+                    command=["mock:vvp", "patched_reverify.vvp"],
+                    duration_ms=1,
+                    stderr="JACVERIFY_REVERIFY_SEQUENCE is empty",
+                    diagnostics={"stage": "patched_reverify", "attempt": attempt},
+                )
+            selected = sequence[min(max(attempt, 1) - 1, len(sequence) - 1)]
+            if selected == STATUS_PASSED:
+                return _mock_reverify(pass_result=True)
+            if selected == STATUS_VERIFICATION_FAILED:
+                return _mock_reverify(pass_result=False)
+            if selected == STATUS_TOOL_ERROR:
+                return _tool_error(
+                    tool="mock:vvp",
+                    mode="mock",
+                    command=["mock:vvp", "patched_reverify.vvp"],
+                    duration_ms=1,
+                    stderr="mock reverify tool error",
+                    diagnostics={"stage": "patched_reverify", "attempt": attempt},
+                    exit_code=2,
+                )
+            return _tool_error(
+                tool="mock:vvp",
+                mode="mock",
+                command=["mock:vvp", "patched_reverify.vvp"],
+                duration_ms=1,
+                stderr=f"unsupported mock reverify status: {selected}",
+                diagnostics={"stage": "patched_reverify", "attempt": attempt},
+            )
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
     paths = _fifo_paths(workspace_root)
@@ -697,12 +747,279 @@ def generate_artifact_mock(
     )
 
 
+def _firecrawl_agent(
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one bounded Firecrawl Agent extraction and return its typed data."""
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "FIRECRAWL_API_KEY is empty. Keep JACVERIFY_MOCK_LLM=1 or put a "
+            "Firecrawl key in the local .env file."
+        )
+
+    base_url = os.environ.get(
+        "FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2"
+    ).rstrip("/")
+    model = os.environ.get("JACVERIFY_FIRECRAWL_MODEL", "spark-1-mini").strip()
+    max_credits = int(os.environ.get("JACVERIFY_FIRECRAWL_MAX_CREDITS", "100"))
+    timeout_seconds = int(
+        os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "60")
+    )
+    poll_seconds = float(
+        os.environ.get("JACVERIFY_FIRECRAWL_POLL_SECONDS", "2")
+    )
+
+    if model not in {"spark-1-mini", "spark-1-pro"}:
+        raise RuntimeError(f"Unsupported Firecrawl Agent model: {model}")
+    if not 1 <= max_credits <= 2500:
+        raise RuntimeError("JACVERIFY_FIRECRAWL_MAX_CREDITS must be 1..2500")
+    if not 5 <= timeout_seconds <= 300:
+        raise RuntimeError("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS must be 5..300")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "JacVerify/0.1",
+    }
+
+    def request_json(
+        url: str,
+        *,
+        method: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body = (
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            if payload is not None
+            else None
+        )
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(
+                f"Firecrawl HTTP {exc.code}: {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Firecrawl connection failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Firecrawl returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Firecrawl returned a non-object response")
+        return decoded
+
+    started = request_json(
+        f"{base_url}/agent",
+        method="POST",
+        payload={
+            "prompt": prompt[:10000],
+            "schema": schema,
+            "maxCredits": max_credits,
+            "model": model,
+        },
+    )
+    job_id = started.get("id")
+    if started.get("success") is not True or not isinstance(job_id, str):
+        raise RuntimeError(
+            f"Firecrawl did not start an agent job: {started.get('error', started)}"
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = request_json(f"{base_url}/agent/{job_id}", method="GET")
+        state = status.get("status")
+        if state == "completed":
+            data = status.get("data")
+            if not isinstance(data, dict):
+                raise RuntimeError("Firecrawl completed without object data")
+            return data
+        if state == "failed":
+            raise RuntimeError(
+                f"Firecrawl agent failed: {status.get('error', 'unknown error')}"
+            )
+        if state != "processing":
+            raise RuntimeError(f"Unexpected Firecrawl agent status: {state!r}")
+        time.sleep(poll_seconds)
+
+    raise RuntimeError(
+        f"Firecrawl agent timed out after {timeout_seconds}s"
+    )
+
+
+def rank_hypotheses_firecrawl(
+    failure: FailureEvidence,
+) -> list[HypothesisDraft]:
+    """Experimental use of Firecrawl Agent as a constrained RTL reasoner."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "hypotheses": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "rank": {"type": "integer", "minimum": 1, "maximum": 3},
+                        "claim": {"type": "string"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "next_action": {"type": "string"},
+                    },
+                    "required": [
+                        "rank",
+                        "claim",
+                        "confidence",
+                        "next_action",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["hypotheses"],
+        "additionalProperties": False,
+    }
+    data = _firecrawl_agent(
+        prompt=(
+            "Do not browse the web. Use only the evidence below. Act as a "
+            "conservative RTL verification engineer. Return exactly three "
+            "distinct, falsifiable FIFO root-cause hypotheses. Never declare "
+            "PASS and never invent waveform facts.\n\n"
+            "Requirements:\n"
+            "- Reset leaves the FIFO empty and write-ready.\n"
+            "- Values preserve FIFO ordering.\n"
+            "- Exactly DEPTH entries are accepted before full.\n"
+            "- Empty reads do not advance read_ptr.\n"
+            "- Simultaneous accepted read/write preserves occupancy.\n\n"
+            f"Failure kind: {failure.kind}\n"
+            f"Expected: {failure.expected or ''}\n"
+            f"Observed: {failure.observed or ''}\n"
+            f"Cycle: {failure.cycle if failure.cycle is not None else ''}\n"
+            f"Simulator output:\n{failure.raw_stdout[-4000:]}"
+        ),
+        schema=schema,
+    )
+    items = data.get("hypotheses")
+    if not isinstance(items, list) or len(items) != 3:
+        raise RuntimeError("Firecrawl must return exactly three hypotheses")
+
+    drafts: list[HypothesisDraft] = []
+    seen_ranks: set[int] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise RuntimeError("Firecrawl returned a malformed hypothesis")
+        rank = int(raw.get("rank", 0))
+        confidence = float(raw.get("confidence", -1))
+        claim = str(raw.get("claim", "")).strip()
+        next_action = str(raw.get("next_action", "")).strip()
+        if (
+            rank not in {1, 2, 3}
+            or rank in seen_ranks
+            or not 0 <= confidence <= 1
+            or not claim
+            or not next_action
+        ):
+            raise RuntimeError("Firecrawl returned an invalid hypothesis")
+        seen_ranks.add(rank)
+        drafts.append(
+            HypothesisDraft(
+                rank=rank,
+                claim=claim,
+                confidence=confidence,
+                next_action=next_action,
+            )
+        )
+    return sorted(drafts, key=lambda item: item.rank)
+
+
+def generate_artifact_firecrawl(
+    hypothesis: HypothesisDraft,
+    module_name: str,
+) -> ArtifactDraft:
+    """Ask Firecrawl for a plan while retaining a hard-coded reviewed path."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "directed_test",
+                    "sva_assertion",
+                    "reviewed_rtl_candidate",
+                ],
+            },
+            "description": {"type": "string"},
+            "verification_goal": {"type": "string"},
+            "rationale": {"type": "string"},
+        },
+        "required": [
+            "kind",
+            "description",
+            "verification_goal",
+            "rationale",
+        ],
+        "additionalProperties": False,
+    }
+    data = _firecrawl_agent(
+        prompt=(
+            "Do not browse the web. Use only the hypothesis below. Propose one "
+            "minimal FIFO verification artifact. Do not return code, paths, "
+            "shell commands, or a PASS/FAIL verdict. Prefer a directed "
+            "wraparound test or focused assertion.\n\n"
+            f"Module: {module_name}\n"
+            f"Hypothesis: {hypothesis.claim}\n"
+            f"Confidence: {hypothesis.confidence}\n"
+            f"Suggested action: {hypothesis.next_action}"
+        ),
+        schema=schema,
+    )
+    kind = str(data.get("kind", "")).strip()
+    description = str(data.get("description", "")).strip()
+    verification_goal = str(data.get("verification_goal", "")).strip()
+    rationale = str(data.get("rationale", "")).strip()
+    if (
+        kind
+        not in {"directed_test", "sva_assertion", "reviewed_rtl_candidate"}
+        or not description
+        or not verification_goal
+        or not rationale
+    ):
+        raise RuntimeError("Firecrawl returned an invalid artifact proposal")
+    return ArtifactDraft(
+        kind=f"firecrawl_{kind}",
+        description=f"{description} Verification goal: {verification_goal}",
+        candidate_path="demo/fifo/fifo_fixed.sv",
+        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        hypothesis_claim=hypothesis.claim,
+        notes=(
+            f"{rationale} Firecrawl cannot choose or write the RTL path; "
+            "JacVerify re-verifies the checked-in reviewed fixture."
+        ),
+    )
+
+
 def rank_hypotheses(failure: FailureEvidence) -> list[HypothesisDraft]:
     if llm_mode() == "mock":
         return rank_hypotheses_mock(failure)
+    if llm_backend() == "firecrawl":
+        return rank_hypotheses_firecrawl(failure)
     raise RuntimeError(
-        "Live LLM mode requested (JACVERIFY_MOCK_LLM!=1) but no live byllm "
-        "backend is configured for this hackathon build. Set JACVERIFY_MOCK_LLM=1."
+        "Live hypothesis ranking is Jac-native; call "
+        "rank_hypotheses_for_run in jacverify/store.jac. This Python adapter "
+        "only owns the deterministic mock implementation."
     )
 
 
@@ -712,9 +1029,12 @@ def generate_artifact(
 ) -> ArtifactDraft:
     if llm_mode() == "mock":
         return generate_artifact_mock(hypothesis, module_name)
+    if llm_backend() == "firecrawl":
+        return generate_artifact_firecrawl(hypothesis, module_name)
     raise RuntimeError(
-        "Live LLM mode requested (JACVERIFY_MOCK_LLM!=1) but no live byllm "
-        "backend is configured for this hackathon build. Set JACVERIFY_MOCK_LLM=1."
+        "Live artifact proposal is Jac-native; call "
+        "generate_artifact_for_run in jacverify/store.jac. This Python adapter "
+        "only owns the deterministic mock implementation."
     )
 
 
@@ -748,6 +1068,26 @@ def make_hypothesis_draft(
         claim=claim,
         confidence=confidence,
         next_action=next_action,
+    )
+
+
+def make_artifact_draft(
+    *,
+    kind: str,
+    description: str,
+    candidate_path: str,
+    candidate_label: str,
+    hypothesis_claim: str,
+    notes: str,
+) -> ArtifactDraft:
+    """Build the Python DTO after Jac validates the typed LLM response."""
+    return ArtifactDraft(
+        kind=kind,
+        description=description,
+        candidate_path=candidate_path,
+        candidate_label=candidate_label,
+        hypothesis_claim=hypothesis_claim,
+        notes=notes,
     )
 
 

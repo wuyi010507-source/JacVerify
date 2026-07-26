@@ -241,6 +241,12 @@ def:pub Dashboard -> JsxElement {
                                 <span>LLM MODE</span>
                                 <strong>{demo_run.llm_mode}</strong>
                             </div>
+                            <div>
+                                <span>DEBUG ATTEMPT</span>
+                                <strong>
+                                    {demo_run.debug_attempt}/{demo_run.max_debug_attempts}
+                                </strong>
+                            </div>
                         </div>
 
                         <div className="mode-row">
@@ -290,7 +296,9 @@ def:pub Dashboard -> JsxElement {
                             }}
                             {if demo_run.top_hypothesis {
                                 <div className="hypothesis-box">
-                                    <div className="eyebrow">TOP HYPOTHESIS</div>
+                                    <div className="eyebrow">
+                                        SELECTED HYPOTHESIS · RANK {demo_run.selected_hypothesis_rank}
+                                    </div>
                                     <p>{demo_run.top_hypothesis}</p>
                                     <small>confidence={str(demo_run.top_confidence)[:4]} · model inference, not proof</small>
                                 </div>
@@ -309,7 +317,13 @@ def:pub Dashboard -> JsxElement {
                                 </div>
                             }}
                             {if demo_run.stop_reason {
-                                <div className="error-banner">{demo_run.stop_reason}</div>
+                                <div className="error-banner">
+                                    {
+                                        "USER REVIEW REQUIRED · " + demo_run.stop_reason
+                                        if demo_run.needs_user_review
+                                        else demo_run.stop_reason
+                                    }
+                                </div>
                             }}
                         </div>
 

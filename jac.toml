@@ -34,8 +34,11 @@ port = 8000
 [test]
 verbose = true
 
+[byllm.call_params]
+temperature = 0.1
+max_output_retries = 2
+
 [client.app_meta_data]
 title = "JacVerify"
 description = "Evidence-driven verification decision intelligence"
 theme_color = "#07111f"
-

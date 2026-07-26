@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import jacverify.tool_adapter as tool_adapter
 from jacverify.tool_adapter import (
     STATUS_BUG_NOT_REPRODUCED,
     STATUS_PASSED,
@@ -80,6 +81,20 @@ def test_reverify_failure_status(
     assert result.status == STATUS_VERIFICATION_FAILED
 
 
+def test_mock_reverify_sequence_is_selected_by_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "JACVERIFY_REVERIFY_SEQUENCE",
+        "VERIFICATION_FAILED,TOOL_ERROR,PASSED",
+    )
+    workspace = Path(__file__).resolve().parents[1]
+
+    assert run_reverify(str(workspace), str(tmp_path), 1).status == STATUS_VERIFICATION_FAILED
+    assert run_reverify(str(workspace), str(tmp_path), 2).status == STATUS_TOOL_ERROR
+    assert run_reverify(str(workspace), str(tmp_path), 3).status == STATUS_PASSED
+
+
 def test_live_mode_without_iverilog_is_tool_error_not_silent_mock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -98,3 +113,69 @@ def test_legacy_suite_helper_still_works(tmp_path: Path) -> None:
     assert evidence.smoke.status == STATUS_PASSED
     assert evidence.failing_regression.status == STATUS_VERIFICATION_FAILED
     assert evidence.patched_reverify.status == STATUS_PASSED
+
+
+def test_firecrawl_live_adapter_parses_typed_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JACVERIFY_MOCK_LLM", "0")
+    monkeypatch.setenv("JACVERIFY_LLM_BACKEND", "firecrawl")
+    outputs = iter(
+        [
+            {
+                "hypotheses": [
+                    {
+                        "rank": 1,
+                        "claim": "write_ptr wraps to the wrong slot",
+                        "confidence": 0.9,
+                        "next_action": "run a directed wrap test",
+                    },
+                    {
+                        "rank": 2,
+                        "claim": "read_ptr wrap is incorrect",
+                        "confidence": 0.2,
+                        "next_action": "inspect read_ptr at DEPTH-1",
+                    },
+                    {
+                        "rank": 3,
+                        "claim": "count drifts during concurrent operations",
+                        "confidence": 0.1,
+                        "next_action": "check simultaneous read/write occupancy",
+                    },
+                ]
+            },
+            {
+                "kind": "directed_test",
+                "description": "Exercise FIFO wraparound twice.",
+                "verification_goal": "Preserve ordering across pointer wrap.",
+                "rationale": "The sequence isolates pointer rollover behavior.",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        tool_adapter,
+        "_firecrawl_agent",
+        lambda **_: next(outputs),
+    )
+    regression = run_wrap_regression(".", "/tmp/jacverify-firecrawl-parse")
+    failure = parse_failure_evidence(regression)
+    assert failure is not None
+
+    hypotheses = rank_hypotheses(failure)
+    artifact = generate_artifact(hypotheses[0], "fifo")
+
+    assert hypotheses[0].rank == 1
+    assert hypotheses[0].confidence == 0.9
+    assert artifact.kind == "firecrawl_directed_test"
+    assert artifact.candidate_path == "demo/fifo/fifo_fixed.sv"
+
+
+def test_firecrawl_live_adapter_requires_local_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JACVERIFY_MOCK_LLM", "0")
+    monkeypatch.setenv("JACVERIFY_LLM_BACKEND", "firecrawl")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="FIRECRAWL_API_KEY is empty"):
+        tool_adapter._firecrawl_agent(prompt="test", schema={"type": "object"})

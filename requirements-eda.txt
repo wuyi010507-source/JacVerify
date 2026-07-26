@@ -1,0 +1,4 @@
+# cocotb 2.0.x supports Python through 3.13. Keep the EDA runner in the
+# repository's host-Python .venv instead of Jac 0.34.7's Python 3.14 runtime.
+cocotb~=2.0
+pytest~=9.1

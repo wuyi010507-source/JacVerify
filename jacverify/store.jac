@@ -10,8 +10,10 @@ import from jacverify.tool_adapter {
     fresh_run_id,
     generate_artifact,
     lint_compile,
+    llm_backend,
     llm_mode,
     load_spec,
+    make_artifact_draft,
     make_hypothesis_draft,
     parse_failure_from_stored,
     rank_hypotheses,
@@ -19,6 +21,14 @@ import from jacverify.tool_adapter {
     run_smoke,
     run_wrap_regression,
     tools_mode
+}
+import from jacverify.llm_calls {
+    ArtifactProposalOutput,
+    FifoFailureContext,
+    HypothesisRankingOutput,
+    RankedHypothesisOutput,
+    propose_fifo_artifact,
+    rank_fifo_failure
 }
 
 # ---------------------------------------------------------------------------
@@ -104,6 +114,10 @@ node Run {
         failure_cycle: str = "",
         top_hypothesis: str = "",
         top_confidence: float = 0.0,
+        debug_attempt: int = 0,
+        max_debug_attempts: int = 3,
+        selected_hypothesis_rank: int = 0,
+        needs_user_review: bool = False,
         artifact_description: str = "",
         candidate_label: str = "",
         candidate_path: str = "",
@@ -129,6 +143,9 @@ node Hypothesis {
         confidence: float,
         next_action: str,
         run_id: str,
+        status: str = "pending",
+        attempt_number: int = 0,
+        rejection_reason: str = "",
         source_walker: str = "RankHypothesesWalker";
 }
 
@@ -138,6 +155,9 @@ node Artifact {
         candidate_path: str,
         candidate_label: str,
         run_id: str,
+        attempt_number: int = 0,
+        status: str = "generated",
+        reverify_status: str = "NOT_RUN",
         source_walker: str = "GenerateArtifactWalker";
 }
 
@@ -246,6 +266,10 @@ obj DemoRunResult {
         failure_cycle: str = "",
         top_hypothesis: str = "",
         top_confidence: float = 0.0,
+        debug_attempt: int = 0,
+        max_debug_attempts: int = 3,
+        selected_hypothesis_rank: int = 0,
+        needs_user_review: bool = False,
         artifact_description: str = "",
         candidate_label: str = "",
         candidate_applied: bool = False,
@@ -562,6 +586,31 @@ def block_run(run: Run, reason: str, walker_name: str) -> None {
     }
 }
 
+def request_user_review(
+    run: Run,
+    reason: str,
+    event: str,
+    evidence_kind: str,
+    evidence_ids: list[str],
+    walker_name: str
+) -> None {
+    from_state = run.current_state;
+    append_transition(
+        run,
+        from_state,
+        "NEEDS_USER_REVIEW",
+        event,
+        reason,
+        evidence_kind,
+        evidence_ids,
+        walker_name
+    );
+    run.status = "blocked";
+    run.stop_reason = reason;
+    run.needs_user_review = True;
+    run.current_state = "NEEDS_USER_REVIEW";
+}
+
 def list_run_transitions(run: Run) -> list[TransitionView] {
     records = sorted(
         [run ->:HasTransition:->],
@@ -622,6 +671,10 @@ def build_demo_result(run: Run) -> DemoRunResult {
         failure_cycle=run.failure_cycle,
         top_hypothesis=run.top_hypothesis,
         top_confidence=run.top_confidence,
+        debug_attempt=run.debug_attempt,
+        max_debug_attempts=run.max_debug_attempts,
+        selected_hypothesis_rank=run.selected_hypothesis_rank,
+        needs_user_review=run.needs_user_review,
         artifact_description=run.artifact_description,
         candidate_label=run.candidate_label,
         candidate_applied=run.candidate_applied,
@@ -634,17 +687,110 @@ def build_demo_result(run: Run) -> DemoRunResult {
 # Constrained LLM wrappers (typed interface; mock by default)
 # ---------------------------------------------------------------------------
 
-# Rank diagnostic hypotheses only. Never declares design PASS/FAIL.
-def rank_hypotheses_for_run(failure: FailureEvidence) -> list[HypothesisDraft] {
-    return rank_hypotheses(failure);
+# Keep the first live prompt small and tied to the checked-in FIFO requirements.
+def fifo_failure_context(
+    module_name: str,
+    failure_kind: str,
+    expected: str,
+    observed: str,
+    cycle: str,
+    tool_output: str
+) -> FifoFailureContext {
+    return FifoFailureContext(
+        module_name=module_name,
+        requirements=[
+            "Reset leaves the FIFO empty and ready to accept a write.",
+            "Values are read in the same order in which they were accepted.",
+            "The FIFO accepts exactly DEPTH entries before asserting full.",
+            "A read while empty does not advance the read pointer.",
+            "A simultaneous accepted read and write preserves occupancy."
+        ],
+        failure_kind=failure_kind,
+        expected=expected,
+        observed=observed,
+        cycle=cycle,
+        tool_output=tool_output
+    );
 }
 
-# Draft a reviewed candidate description. Never declares design PASS.
+# Rank diagnostic hypotheses only. Never declares design PASS/FAIL.
+def rank_hypotheses_for_run(failure: FailureEvidence) -> list[HypothesisDraft] {
+    if llm_mode() == "mock" or llm_backend() == "firecrawl" {
+        return rank_hypotheses(failure);
+    }
+    context = fifo_failure_context(
+        "fifo",
+        failure.kind,
+        failure.expected if failure.expected is not None else "",
+        failure.observed if failure.observed is not None else "",
+        str(failure.cycle) if failure.cycle is not None else "",
+        failure.raw_stdout
+    );
+    ranking: HypothesisRankingOutput = rank_fifo_failure(context);
+    drafts: list[HypothesisDraft] = [];
+    for item in ranking.hypotheses {
+        if item.rank < 1 or item.confidence < 0.0 or item.confidence > 1.0 {
+            continue;
+        }
+        drafts.append(
+            make_hypothesis_draft(
+                item.rank,
+                item.claim,
+                item.confidence,
+                item.next_action
+            )
+        );
+    }
+    return sorted(
+        drafts,
+        key=lambda (item: HypothesisDraft) {
+            item.rank;
+        }
+    );
+}
+
+# Draft a reviewed candidate description. The LLM never controls the path.
 def generate_artifact_for_run(
     hypothesis: HypothesisDraft,
-    module_name: str
+    module_name: str,
+    failure_kind: str,
+    expected: str,
+    observed: str,
+    cycle: str,
+    tool_output: str
 ) -> ArtifactDraft {
-    return generate_artifact(hypothesis, module_name);
+    if llm_mode() == "mock" or llm_backend() == "firecrawl" {
+        return generate_artifact(hypothesis, module_name);
+    }
+    context = fifo_failure_context(
+        module_name,
+        failure_kind,
+        expected,
+        observed,
+        cycle,
+        tool_output
+    );
+    top = RankedHypothesisOutput(
+        rank=hypothesis.rank,
+        claim=hypothesis.claim,
+        confidence=hypothesis.confidence,
+        next_action=hypothesis.next_action
+    );
+    proposal: ArtifactProposalOutput = propose_fifo_artifact(context, top);
+    return make_artifact_draft(
+        kind="llm_reviewed_candidate_proposal",
+        description=(
+            f"{proposal.description} Verification goal: "
+            f"{proposal.verification_goal}"
+        ),
+        candidate_path="demo/fifo/fifo_fixed.sv",
+        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        hypothesis_claim=hypothesis.claim,
+        notes=(
+            f"{proposal.rationale} The model cannot choose or write the RTL "
+            "path; JacVerify re-verifies the checked-in reviewed fixture."
+        )
+    );
 }
 
 # ---------------------------------------------------------------------------
@@ -1005,12 +1151,26 @@ walker RankHypothesesWalker {
             skip;
         }
         if here.current_state != "D1_HYPOTHESIS_RANK" {
-            block_run(here, "RankHypothesesWalker refused: wrong state", "RankHypothesesWalker");
+            request_user_review(
+                here,
+                "RankHypothesesWalker refused: wrong state",
+                "debug_state_requires_review",
+                "graph_invariant",
+                ["error:wrong_state"],
+                "RankHypothesesWalker"
+            );
             skip;
         }
         failures: list[Failure] = [here ->:FailedWith:->];
         if not failures {
-            block_run(here, "RankHypothesesWalker refused: Failure node missing", "RankHypothesesWalker");
+            request_user_review(
+                here,
+                "RankHypothesesWalker refused: Failure node missing",
+                "failure_evidence_requires_review",
+                "graph_invariant",
+                ["error:failure_missing"],
+                "RankHypothesesWalker"
+            );
             skip;
         }
         failure_node = failures[0];
@@ -1022,18 +1182,33 @@ walker RankHypothesesWalker {
             stdout=here.regression_stdout
         );
         if evidence is None {
-            block_run(here, "RankHypothesesWalker refused: missing structured evidence", "RankHypothesesWalker");
+            request_user_review(
+                here,
+                "RankHypothesesWalker refused: missing structured evidence",
+                "failure_evidence_requires_review",
+                "tool_fact",
+                ["error:structured_evidence_missing"],
+                "RankHypothesesWalker"
+            );
             skip;
         }
         try {
             drafts: list[HypothesisDraft] = rank_hypotheses_for_run(evidence);
             if not drafts {
-                block_run(here, "RankHypothesesWalker produced no hypotheses", "RankHypothesesWalker");
+                request_user_review(
+                    here,
+                    "RankHypothesesWalker produced no hypotheses",
+                    "hypothesis_ranking_requires_review",
+                    "model_inference",
+                    ["error:no_hypotheses"],
+                    "RankHypothesesWalker"
+                );
                 skip;
             }
             top = drafts[0];
             here.top_hypothesis = top.claim;
             here.top_confidence = top.confidence;
+            here.selected_hypothesis_rank = top.rank;
             for draft in drafts {
                 failure_node +>:Motivates:+> Hypothesis(
                     rank=draft.rank,
@@ -1041,6 +1216,7 @@ walker RankHypothesesWalker {
                     confidence=draft.confidence,
                     next_action=draft.next_action,
                     run_id=here.run_id,
+                    status="selected" if draft.rank == top.rank else "pending",
                     source_walker="RankHypothesesWalker"
                 );
             }
@@ -1065,13 +1241,10 @@ walker RankHypothesesWalker {
                 "RankHypothesesWalker"
             );
         } except Exception as exc {
-            block_run(here, "RankHypothesesWalker failed: " + str(exc), "RankHypothesesWalker");
-            append_transition(
+            request_user_review(
                 here,
-                "D1_HYPOTHESIS_RANK",
-                "BLOCKED",
-                "hypothesis_rank_failed",
-                str(exc),
+                "RankHypothesesWalker failed: " + str(exc),
+                "hypothesis_ranking_requires_review",
                 "model_inference",
                 ["error:llm"],
                 "RankHypothesesWalker"
@@ -1092,26 +1265,76 @@ walker GenerateArtifactWalker {
             skip;
         }
         if here.current_state != "D3_GENERATE_ARTIFACT" {
-            block_run(here, "GenerateArtifactWalker refused: wrong state", "GenerateArtifactWalker");
+            request_user_review(
+                here,
+                "GenerateArtifactWalker refused: wrong state",
+                "debug_state_requires_review",
+                "graph_invariant",
+                ["error:wrong_state"],
+                "GenerateArtifactWalker"
+            );
             skip;
         }
         failures: list[Failure] = [here ->:FailedWith:->];
         if not failures {
-            block_run(here, "GenerateArtifactWalker refused: Failure missing", "GenerateArtifactWalker");
+            request_user_review(
+                here,
+                "GenerateArtifactWalker refused: Failure missing",
+                "failure_evidence_requires_review",
+                "graph_invariant",
+                ["error:failure_missing"],
+                "GenerateArtifactWalker"
+            );
             skip;
         }
         hyps: list[Hypothesis] = [failures[0] ->:Motivates:->];
         if not hyps {
-            block_run(here, "GenerateArtifactWalker refused: Hypothesis missing", "GenerateArtifactWalker");
+            request_user_review(
+                here,
+                "GenerateArtifactWalker refused: Hypothesis missing",
+                "hypothesis_ranking_requires_review",
+                "graph_invariant",
+                ["error:hypothesis_missing"],
+                "GenerateArtifactWalker"
+            );
             skip;
         }
-        ranked = sorted(
+        ranked: list[Hypothesis] = sorted(
             hyps,
             key=lambda (item: Hypothesis) {
                 item.rank;
             }
         );
-        top = ranked[0];
+        selected = [
+            item for item in ranked
+            if item.rank == here.selected_hypothesis_rank
+            and item.status == "selected"
+        ];
+        if not selected {
+            request_user_review(
+                here,
+                "No selected hypothesis is available for the next debug attempt.",
+                "selected_hypothesis_missing",
+                "action_recommendation",
+                [f"selected_rank:{here.selected_hypothesis_rank}"],
+                "GenerateArtifactWalker"
+            );
+            skip;
+        }
+        if here.debug_attempt >= here.max_debug_attempts {
+            request_user_review(
+                here,
+                f"Debug attempt limit {here.max_debug_attempts} reached before artifact generation.",
+                "debug_attempt_limit_reached",
+                "policy_decision",
+                [f"attempts:{here.debug_attempt}"],
+                "GenerateArtifactWalker"
+            );
+            skip;
+        }
+        top = selected[0];
+        here.debug_attempt += 1;
+        top.attempt_number = here.debug_attempt;
         draft_in = make_hypothesis_draft(
             top.rank,
             top.claim,
@@ -1125,7 +1348,12 @@ walker GenerateArtifactWalker {
         try {
             artifact_draft: ArtifactDraft = generate_artifact_for_run(
                 draft_in,
-                module_name
+                module_name,
+                failures[0].kind,
+                failures[0].expected,
+                failures[0].observed,
+                failures[0].cycle,
+                failures[0].raw_stdout
             );
             here.artifact_description = artifact_draft.description;
             here.candidate_label = artifact_draft.candidate_label;
@@ -1136,6 +1364,8 @@ walker GenerateArtifactWalker {
                 candidate_path=artifact_draft.candidate_path,
                 candidate_label=artifact_draft.candidate_label,
                 run_id=here.run_id,
+                attempt_number=here.debug_attempt,
+                status="generated",
                 source_walker="GenerateArtifactWalker"
             );
             append_transition(
@@ -1145,19 +1375,21 @@ walker GenerateArtifactWalker {
                 "artifact_generated",
                 artifact_draft.description,
                 "action_recommendation",
-                [artifact_draft.candidate_label, f"llm_mode:{here.llm_mode}"],
+                [
+                    artifact_draft.candidate_label,
+                    f"llm_mode:{here.llm_mode}",
+                    f"attempt:{here.debug_attempt}",
+                    f"hypothesis:rank-{top.rank}"
+                ],
                 "GenerateArtifactWalker"
             );
         } except Exception as exc {
-            block_run(here, "GenerateArtifactWalker failed: " + str(exc), "GenerateArtifactWalker");
-            append_transition(
+            request_user_review(
                 here,
-                "D3_GENERATE_ARTIFACT",
-                "BLOCKED",
-                "artifact_generation_failed",
-                str(exc),
+                "GenerateArtifactWalker failed: " + str(exc),
+                "artifact_generation_requires_review",
                 "action_recommendation",
-                ["error:llm"],
+                ["error:llm", f"attempt:{here.debug_attempt}"],
                 "GenerateArtifactWalker"
             );
         }
@@ -1176,23 +1408,61 @@ walker ReverifyAndRenderWalker {
             skip;
         }
         if here.current_state != "D4_APPLY_CANDIDATE" {
-            block_run(here, "ReverifyAndRenderWalker refused: wrong state", "ReverifyAndRenderWalker");
+            request_user_review(
+                here,
+                "ReverifyAndRenderWalker refused: wrong state",
+                "debug_state_requires_review",
+                "graph_invariant",
+                ["error:wrong_state"],
+                "ReverifyAndRenderWalker"
+            );
             skip;
         }
         if not here.candidate_path {
-            block_run(here, "ReverifyAndRenderWalker refused: candidate missing", "ReverifyAndRenderWalker");
+            request_user_review(
+                here,
+                "ReverifyAndRenderWalker refused: candidate missing",
+                "artifact_missing",
+                "graph_invariant",
+                ["error:candidate_missing"],
+                "ReverifyAndRenderWalker"
+            );
             skip;
         }
-        artifacts: list[Artifact] = [];
-        for failure in [here ->:FailedWith:->] {
-            for hyp in [failure ->:Motivates:->] {
-                for art in [hyp ->:Produces:->] {
-                    artifacts.append(art);
-                }
-            }
+        failures: list[Failure] = [here ->:FailedWith:->];
+        hypotheses: list[Hypothesis] = [];
+        if failures {
+            hypotheses = [
+                hyp for hyp in [failures[0] ->:Motivates:->]
+                if hyp.rank == here.selected_hypothesis_rank
+                and hyp.status == "selected"
+            ];
         }
+        if not hypotheses {
+            request_user_review(
+                here,
+                "ReverifyAndRenderWalker could not resolve the selected hypothesis.",
+                "selected_hypothesis_missing",
+                "graph_invariant",
+                [f"selected_rank:{here.selected_hypothesis_rank}"],
+                "ReverifyAndRenderWalker"
+            );
+            skip;
+        }
+        selected_hypothesis = hypotheses[0];
+        artifacts: list[Artifact] = [
+            art for art in [selected_hypothesis ->:Produces:->]
+            if art.attempt_number == here.debug_attempt
+        ];
         if not artifacts {
-            block_run(here, "ReverifyAndRenderWalker refused: Artifact node missing", "ReverifyAndRenderWalker");
+            request_user_review(
+                here,
+                "ReverifyAndRenderWalker could not resolve the current Artifact.",
+                "artifact_missing",
+                "graph_invariant",
+                [f"attempt:{here.debug_attempt}"],
+                "ReverifyAndRenderWalker"
+            );
             skip;
         }
         artifact_node = artifacts[0];
@@ -1210,12 +1480,17 @@ walker ReverifyAndRenderWalker {
             "ReverifyAndRenderWalker"
         );
 
-        result: ToolResult = run_reverify(here.workspace_root, here.output_dir);
+        result: ToolResult = run_reverify(
+            here.workspace_root,
+            here.output_dir,
+            here.debug_attempt
+        );
         here.reverify_status = result.status;
         here.reverify_stdout = result.stdout;
-        reverify_run_id = here.run_id + ":reverify";
-        reverify_state = "BLOCKED";
-        reverify_status = "blocked";
+        artifact_node.reverify_status = result.status;
+        reverify_run_id = here.run_id + f":reverify:{here.debug_attempt}";
+        reverify_state = result.status;
+        reverify_status = "failed";
         if result.status == "PASSED" {
             reverify_state = "DONE";
             reverify_status = "complete";
@@ -1238,6 +1513,8 @@ walker ReverifyAndRenderWalker {
         artifact_node +>:ReverifiedBy:+> reverify_run;
 
         if result.status == "PASSED" {
+            selected_hypothesis.status = "supported";
+            artifact_node.status = "reverify_passed";
             append_transition(
                 here,
                 "D5_TARGETED_REVERIFY",
@@ -1245,7 +1522,12 @@ walker ReverifyAndRenderWalker {
                 "reverification_passed",
                 "Re-verification PASSED against reviewed candidate fixture.",
                 "tool_fact",
-                [f"status:{result.status}", f"reverify_run:{reverify_run_id}"],
+                [
+                    f"status:{result.status}",
+                    f"reverify_run:{reverify_run_id}",
+                    f"attempt:{here.debug_attempt}",
+                    f"hypothesis:rank-{selected_hypothesis.rank}"
+                ],
                 "ReverifyAndRenderWalker"
             );
             append_transition(
@@ -1260,20 +1542,91 @@ walker ReverifyAndRenderWalker {
             );
             here.status = "complete";
             here.current_state = "DONE";
-        } else {
-            block_run(
-                here,
-                f"Re-verification did not pass ({result.status})",
-                "ReverifyAndRenderWalker"
+        } elif result.status == "VERIFICATION_FAILED" {
+            selected_hypothesis.status = "rejected";
+            selected_hypothesis.rejection_reason = (
+                f"Targeted re-verification still failed on attempt {here.debug_attempt}."
             );
-            append_transition(
+            artifact_node.status = "reverify_failed";
+            pending: list[Hypothesis] = sorted(
+                [
+                    hyp for hyp in [failures[0] ->:Motivates:->]
+                    if hyp.status == "pending"
+                ],
+                key=lambda (item: Hypothesis) {
+                    item.rank;
+                }
+            );
+            if here.debug_attempt < here.max_debug_attempts and pending {
+                next_hypothesis = pending[0];
+                next_hypothesis.status = "selected";
+                here.selected_hypothesis_rank = next_hypothesis.rank;
+                here.top_hypothesis = next_hypothesis.claim;
+                here.top_confidence = next_hypothesis.confidence;
+                append_transition(
+                    here,
+                    "D5_TARGETED_REVERIFY",
+                    "D2_SELECT_REMEDIATION",
+                    "hypothesis_rejected",
+                    (
+                        f"Attempt {here.debug_attempt} did not resolve the failure; "
+                        f"rejecting rank {selected_hypothesis.rank}."
+                    ),
+                    "tool_fact",
+                    [
+                        f"status:{result.status}",
+                        f"attempt:{here.debug_attempt}",
+                        f"hypothesis:rank-{selected_hypothesis.rank}"
+                    ],
+                    "ReverifyAndRenderWalker"
+                );
+                append_transition(
+                    here,
+                    "D2_SELECT_REMEDIATION",
+                    "D3_GENERATE_ARTIFACT",
+                    "next_hypothesis_selected",
+                    (
+                        f"Selected rank {next_hypothesis.rank} for debug attempt "
+                        f"{here.debug_attempt + 1}: {next_hypothesis.claim}"
+                    ),
+                    "policy_decision",
+                    [
+                        f"next_attempt:{here.debug_attempt + 1}",
+                        f"hypothesis:rank-{next_hypothesis.rank}"
+                    ],
+                    "ReverifyAndRenderWalker"
+                );
+            } else {
+                request_user_review(
+                    here,
+                    (
+                        f"Re-verification failed after {here.debug_attempt} attempts; "
+                        "automatic debug stopped for user intervention."
+                    ),
+                    "debug_attempt_limit_reached",
+                    "policy_decision",
+                    [
+                        f"status:{result.status}",
+                        f"attempts:{here.debug_attempt}",
+                        f"max_attempts:{here.max_debug_attempts}"
+                    ],
+                    "ReverifyAndRenderWalker"
+                );
+            }
+        } else {
+            artifact_node.status = "reverify_unknown";
+            request_user_review(
                 here,
-                "D5_TARGETED_REVERIFY",
-                "BLOCKED",
-                "reverification_failed",
-                f"Re-verification returned {result.status}; refusing DONE.",
+                (
+                    f"Re-verification returned {result.status}; this case is not "
+                    "safe to auto-retry and requires user intervention."
+                ),
+                "unexpected_reverify_requires_review",
                 "tool_fact",
-                [f"status:{result.status}"],
+                [
+                    f"status:{result.status}",
+                    f"attempt:{here.debug_attempt}"
+                ],
                 "ReverifyAndRenderWalker"
             );
         }
@@ -1413,11 +1766,14 @@ def:pub run_fifo_demo -> DemoRunResult {
     if run.status == "running" {
         root spawn RankHypothesesWalker(run_id=run_id);
     }
-    if run.status == "running" {
+    while (
+        run.status == "running"
+        and run.current_state == "D3_GENERATE_ARTIFACT"
+    ) {
         root spawn GenerateArtifactWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn ReverifyAndRenderWalker(run_id=run_id);
+        if run.status == "running" {
+            root spawn ReverifyAndRenderWalker(run_id=run_id);
+        }
     }
     return build_demo_result(run);
 }
