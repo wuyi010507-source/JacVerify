@@ -46,13 +46,16 @@ Open [http://localhost:8000](http://localhost:8000).
 ## Verify
 
 ```bash
-jac clean --data --force
-jac test jacverify/store.jac -v
+JAC_DATA_PATH="$(mktemp -d)" jac test jacverify/store.jac -v
 .jac/venv/bin/python -m pytest tests/test_tool_adapter.py -q
-jac check .
+JAC_DATA_PATH="$(mktemp -d)" jac check .
 ```
 
-`jac clean --data` resets persisted graph data without deleting installed project dependencies. Avoid `jac clean --all` immediately before Python tests because it removes `.jac/venv`.
+The temporary `JAC_DATA_PATH` keeps test state separate from the live demo graph. With
+Jac 0.34.7 microservice mode, do not run `jac clean --data` against a stopped or
+running demo and then reuse its service user database: the stale guest-root record can
+point at a deleted graph anchor. Avoid `jac clean --all` immediately before Python
+tests because it removes `.jac/venv`.
 
 ## Architecture
 
