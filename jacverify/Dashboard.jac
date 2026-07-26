@@ -229,6 +229,34 @@ def:pub Dashboard -> JsxElement {
                             </div>
                         </div>
 
+                        <div className="tool-proof">
+                            <div className="tool-proof-heading">
+                                <div>
+                                    <div className="eyebrow">EXECUTABLE TOOL EVIDENCE</div>
+                                    <h3>{demo_run.toolchain}</h3>
+                                    <p className="proof-subline">
+                                        {demo_run.requirement_count} requirements loaded from fifo_spec.md
+                                    </p>
+                                </div>
+                                <span className={"proof-status ready" if demo_run.tool_evidence_available else "proof-status blocked"}>
+                                    {"REAL RUN VERIFIED" if demo_run.tool_evidence_available else "TOOL RUN BLOCKED"}
+                                </span>
+                            </div>
+                            <div className="terminal-grid">
+                                <div className="terminal">
+                                    <div className="terminal-label failure-output">BUGGY RTL · EXPECTED FAILURE</div>
+                                    <pre>{demo_run.regression_output}</pre>
+                                </div>
+                                <div className="terminal">
+                                    <div className="terminal-label pass-output">PATCH FIXTURE · REVERIFY PASS</div>
+                                    <pre>{demo_run.reverify_output}</pre>
+                                </div>
+                            </div>
+                            <div className="manifest-path">
+                                Artifact manifest: {demo_run.artifact_manifest}
+                            </div>
+                        </div>
+
                         <div className="timeline">
                             {for transition in demo_run.transitions {
                                 <article key={transition.sequence} className="timeline-item">

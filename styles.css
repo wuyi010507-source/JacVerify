@@ -502,6 +502,91 @@ h1 {
   color: var(--green);
 }
 
+.tool-proof {
+  border: 1px solid rgba(82, 242, 177, 0.35);
+  background: rgba(6, 20, 31, 0.86);
+  padding: 22px;
+}
+
+.tool-proof-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 16px;
+}
+
+.tool-proof-heading h3 {
+  margin: 0;
+}
+
+.proof-subline {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 5px 0 0;
+}
+
+.proof-status {
+  font-family: "DM Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  padding: 6px 8px;
+  border: 1px solid;
+}
+
+.proof-status.ready {
+  color: var(--green);
+  border-color: rgba(82, 242, 177, 0.55);
+}
+
+.proof-status.blocked {
+  color: var(--red);
+  border-color: rgba(255, 111, 125, 0.55);
+}
+
+.terminal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.terminal {
+  border: 1px solid #253c50;
+  background: #030a11;
+  min-height: 128px;
+}
+
+.terminal-label {
+  font-family: "DM Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  border-bottom: 1px solid #253c50;
+  padding: 8px 10px;
+}
+
+.failure-output {
+  color: var(--red);
+}
+
+.pass-output {
+  color: var(--green);
+}
+
+.terminal pre {
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 14px;
+  color: #b9cad8;
+  font: 11px/1.6 "DM Mono", monospace;
+}
+
+.manifest-path {
+  color: #70879b;
+  font: 9px/1.5 "DM Mono", monospace;
+  margin-top: 12px;
+  word-break: break-all;
+}
+
 .timeline {
   display: grid;
   gap: 0;
@@ -629,7 +714,8 @@ h1 {
 
   .project-heading,
   .section-title-row,
-  .task-hero {
+  .task-hero,
+  .tool-proof-heading {
     align-items: flex-start;
     flex-direction: column;
   }
@@ -644,5 +730,9 @@ h1 {
 
   .view-tabs {
     overflow-x: auto;
+  }
+
+  .terminal-grid {
+    grid-template-columns: 1fr;
   }
 }

@@ -1,5 +1,8 @@
 """JacVerify graph model and deterministic decision policy."""
 
+import os;
+import from jacverify.tool_adapter { FifoSuiteEvidence, run_fifo_suite }
+
 node Project {
     has project_id: str,
         name: str,
@@ -89,7 +92,13 @@ obj DemoRunResult {
     has job_id: str,
         current_state: str,
         status: str,
-        transitions: list[TransitionView];
+        transitions: list[TransitionView],
+        tool_evidence_available: bool,
+        requirement_count: int,
+        toolchain: str,
+        regression_output: str,
+        reverify_output: str,
+        artifact_manifest: str;
 }
 
 def score_action(candidate: ActionCandidate) -> float {
@@ -271,9 +280,9 @@ def plan_transition(current_state: str) -> PlannedTransition {
         return PlannedTransition(
             to_state="D0_FAILURE_NORMALIZE",
             event="scoreboard_mismatch",
-            summary="Expected 0xA7, observed 0x13 at cycle 37 after pointer wrap.",
+            summary="Icarus Verilog observed a deterministic mismatch after pointer wrap.",
             evidence_kind="tool_fact",
-            evidence_ids=["tool:run-104", "tool:vcd-slice-37"]
+            evidence_ids=["tool:wrap_regression.vvp", "tool:WRAP_MISMATCH"]
         );
     }
     if current_state == "D0_FAILURE_NORMALIZE" {
@@ -316,9 +325,9 @@ def plan_transition(current_state: str) -> PlannedTransition {
         return PlannedTransition(
             to_state="S9_SIGNOFF_GATE",
             event="targeted_reverify_pass",
-            summary="Directed reverify passed and the original failure did not recur.",
+            summary="The same directed test passed against the pre-approved patch fixture.",
             evidence_kind="tool_fact",
-            evidence_ids=["tool:targeted-run-105", "tool:regression-diff"]
+            evidence_ids=["tool:patched_reverify.vvp", "tool:WRAP_TEST_PASS"]
         );
     }
     if current_state == "S9_SIGNOFF_GATE" {
@@ -454,6 +463,19 @@ def:pub get_dashboard -> DashboardData {
 }
 
 def:pub run_fifo_demo -> DemoRunResult {
+    workspace_root = os.getcwd();
+    output_dir = os.path.join(workspace_root, "runs", "fifo-demo");
+    evidence: FifoSuiteEvidence = run_fifo_suite(
+        workspace_root,
+        output_dir
+    );
+    tool_evidence_available = (
+        evidence.spec_requirement_count == 5
+        and evidence.lint.status == "passed"
+        and evidence.smoke.status == "passed"
+        and evidence.failing_regression.status == "failed"
+        and evidence.patched_reverify.status == "passed"
+    );
     job = create_fifo_job("fifo-wrap-demo");
     runner = root spawn StateExecutor(job_id=job.job_id);
     transitions = (
@@ -465,6 +487,12 @@ def:pub run_fifo_demo -> DemoRunResult {
         job_id=job.job_id,
         current_state=job.current_state,
         status=job.status,
-        transitions=transitions
+        transitions=transitions,
+        tool_evidence_available=tool_evidence_available,
+        requirement_count=evidence.spec_requirement_count,
+        toolchain="Icarus Verilog · allow-listed adapter",
+        regression_output=evidence.failing_regression.stdout.strip(),
+        reverify_output=evidence.patched_reverify.stdout.strip(),
+        artifact_manifest=os.path.join(output_dir, "tool_evidence.json")
     );
 }

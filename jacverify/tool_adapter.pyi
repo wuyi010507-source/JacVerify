@@ -15,6 +15,8 @@ class ToolRun:
 
 @dataclass(frozen=True)
 class FifoSuiteEvidence:
+    spec_requirement_count: int
+    spec_path: str
     lint: ToolRun
     smoke: ToolRun
     failing_regression: ToolRun
@@ -22,4 +24,3 @@ class FifoSuiteEvidence:
 
 
 def run_fifo_suite(workspace_root: str, output_dir: str) -> FifoSuiteEvidence: ...
-

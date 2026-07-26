@@ -130,4 +130,8 @@ test "public demo data stays complete across repeated reads" {
     assert len(first_run.transitions) == 10;
     assert len(second_run.transitions) == 10;
     assert second_run.current_state == "DONE";
+    assert first_run.tool_evidence_available;
+    assert first_run.requirement_count == 5;
+    assert "WRAP_MISMATCH" in first_run.regression_output;
+    assert "WRAP_TEST_PASS" in first_run.reverify_output;
 }

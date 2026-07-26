@@ -12,6 +12,7 @@ def test_fifo_suite_produces_real_fail_then_pass_evidence(tmp_path: Path) -> Non
     )
 
     assert evidence.lint.status == "passed"
+    assert evidence.spec_requirement_count == 5
     assert evidence.smoke.status == "passed"
     assert evidence.failing_regression.status == "failed"
     assert "WRAP_MISMATCH" in evidence.failing_regression.stdout

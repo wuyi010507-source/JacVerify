@@ -23,6 +23,8 @@ class ToolRun:
 
 @dataclass(frozen=True)
 class FifoSuiteEvidence:
+    spec_requirement_count: int
+    spec_path: str
     lint: ToolRun
     smoke: ToolRun
     failing_regression: ToolRun
@@ -136,9 +138,17 @@ def run_fifo_suite(workspace_root: str, output_dir: str) -> FifoSuiteEvidence:
     fixed_rtl = fifo_dir / "fifo_fixed.sv"
     smoke_tb = fifo_dir / "tb_smoke.sv"
     wrap_tb = fifo_dir / "tb_wrap.sv"
-    allowlisted_inputs = [buggy_rtl, fixed_rtl, smoke_tb, wrap_tb]
+    spec_path = fifo_dir / "fifo_spec.md"
+    allowlisted_inputs = [buggy_rtl, fixed_rtl, smoke_tb, wrap_tb, spec_path]
     if not all(path.is_file() and fifo_dir in path.parents for path in allowlisted_inputs):
         raise FileNotFoundError("FIFO demo inputs are missing or outside the allow-listed directory")
+    requirement_count = sum(
+        1
+        for line in spec_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- REQ-")
+    )
+    if requirement_count != 5:
+        raise ValueError("FIFO demo specification must contain exactly five requirements")
 
     lint = _execute(
         stage="lint",
@@ -168,6 +178,8 @@ def run_fifo_suite(workspace_root: str, output_dir: str) -> FifoSuiteEvidence:
     )
 
     evidence = FifoSuiteEvidence(
+        spec_requirement_count=requirement_count,
+        spec_path=str(spec_path),
         lint=lint,
         smoke=smoke,
         failing_regression=failing_regression,
@@ -176,4 +188,3 @@ def run_fifo_suite(workspace_root: str, output_dir: str) -> FifoSuiteEvidence:
     manifest = artifacts / "tool_evidence.json"
     manifest.write_text(json.dumps(asdict(evidence), indent=2), encoding="utf-8")
     return evidence
-
