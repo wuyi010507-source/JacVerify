@@ -1,3 +1,15 @@
+# JacVerify build and run artifacts
+.jac/
+runs/*/
+*.vvp
+*.vcd
+obj_dir/
+__pycache__/
+.DS_Store
+.pytest_cache/
+ignore_prep/
+
+# Python defaults from the repository initializer
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -195,9 +207,9 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   and can be added to the global gitignore or merged into this file. However, if you prefer,
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution
