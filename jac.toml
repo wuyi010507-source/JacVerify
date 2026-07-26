@@ -41,4 +41,5 @@ max_output_retries = 2
 [client.app_meta_data]
 title = "JacVerify"
 description = "Evidence-driven verification decision intelligence"
-theme_color = "#07111f"
+theme_color = "#030805"
+og_image = "/jacverify-logo.jpg"

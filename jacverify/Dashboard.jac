@@ -59,11 +59,12 @@ def:pub Dashboard -> JsxElement {
     return <div className="app-shell">
         <header className="topbar">
             <div className="brand-lockup">
-                <div className="brand-mark">JV</div>
-                <div>
-                    <div className="brand-name">JacVerify</div>
-                    <div className="brand-subtitle">Evidence-driven verification loop</div>
-                </div>
+                <div
+                    className="brand-logo"
+                    role="img"
+                    aria-label="JacVerify"
+                ></div>
+                <div className="brand-subtitle">Evidence-driven verification loop</div>
             </div>
             <div className="topbar-actions">
                 <span className="live-dot"></span>

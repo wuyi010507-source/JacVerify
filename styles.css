@@ -3,18 +3,26 @@
 :root {
   color-scheme: dark;
   font-family: "Manrope", sans-serif;
-  background: #07111f;
-  color: #e8f0f7;
-  --bg: #07111f;
-  --panel: #0c1929;
-  --panel-2: #102135;
-  --line: #203750;
-  --muted: #8da3b8;
-  --cyan: #65e6ff;
-  --green: #52f2b1;
-  --amber: #ffbd66;
-  --red: #ff6f7d;
-  --violet: #b59cff;
+  background: #030805;
+  color: #e8f7ee;
+  /* Logo-aligned palette: neon green + mint on near-black */
+  --bg: #030805;
+  --bg-2: #06100a;
+  --panel: #0a1410;
+  --panel-2: #0f1c14;
+  --line: #1c3326;
+  --muted: #7f9a88;
+  --text: #e8f7ee;
+  --text-soft: #a8c4b4;
+  --neon: #2dff6a;
+  --mint: #b8ffd4;
+  --cyan: #2dff6a; /* primary accent (was blue-cyan; mapped to logo neon) */
+  --green: #39f28a;
+  --amber: #e0c36a;
+  --red: #ff6b7a;
+  --violet: #8ed9b0;
+  --neon-glow: rgba(45, 255, 106, 0.18);
+  --neon-soft: rgba(45, 255, 106, 0.08);
 }
 
 * {
@@ -26,8 +34,9 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    radial-gradient(circle at 75% -10%, rgba(75, 147, 255, 0.2), transparent 38rem),
-    linear-gradient(180deg, #07111f 0%, #081523 100%);
+    radial-gradient(circle at 78% -12%, rgba(45, 255, 106, 0.16), transparent 36rem),
+    radial-gradient(circle at 8% 20%, rgba(184, 255, 212, 0.05), transparent 28rem),
+    linear-gradient(180deg, #030805 0%, #06100a 48%, #040a07 100%);
 }
 
 button,
@@ -42,8 +51,8 @@ a {
 .topbar {
   height: 72px;
   padding: 0 5vw;
-  border-bottom: 1px solid rgba(101, 230, 255, 0.15);
-  background: rgba(7, 17, 31, 0.82);
+  border-bottom: 1px solid rgba(45, 255, 106, 0.16);
+  background: rgba(3, 8, 5, 0.88);
   backdrop-filter: blur(18px);
   display: flex;
   align-items: center;
@@ -63,23 +72,17 @@ a {
 }
 
 .brand-lockup {
-  gap: 12px;
+  gap: 14px;
 }
 
-.brand-mark {
-  width: 38px;
-  height: 38px;
-  border: 1px solid var(--cyan);
-  color: var(--cyan);
-  display: grid;
-  place-items: center;
-  font-family: "DM Mono", monospace;
-  box-shadow: inset 0 0 18px rgba(101, 230, 255, 0.1);
-}
-
-.brand-name {
-  font-weight: 700;
-  letter-spacing: -0.02em;
+/* Path is resolved from .jac/client/compiled/styles.css during the Vite build. */
+.brand-logo {
+  display: block;
+  height: 48px;
+  width: 120px;
+  max-width: min(220px, 42vw);
+  flex: 0 0 auto;
+  background: url("../../../assets/jacverify-logo.jpg") left center / contain no-repeat;
 }
 
 .brand-subtitle,
@@ -96,14 +99,18 @@ a {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 12px var(--green);
+  background: var(--neon);
+  box-shadow: 0 0 14px rgba(45, 255, 106, 0.85);
 }
 
 .repo-link {
   margin-left: 16px;
-  color: var(--cyan);
+  color: var(--mint);
   text-decoration: none;
+}
+
+.repo-link:hover {
+  color: var(--neon);
 }
 
 main {
@@ -136,9 +143,10 @@ main {
 }
 
 .eyebrow {
-  color: var(--cyan);
+  color: var(--neon);
   font-size: 12px;
   margin-bottom: 14px;
+  text-shadow: 0 0 18px rgba(45, 255, 106, 0.35);
 }
 
 h1 {
@@ -147,11 +155,15 @@ h1 {
   line-height: 0.95;
   letter-spacing: -0.055em;
   max-width: 790px;
+  background: linear-gradient(105deg, var(--mint) 10%, var(--neon) 55%, var(--mint) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 .hero-copy {
   max-width: 730px;
-  color: #afc0cf;
+  color: #a8c4b4;
   line-height: 1.7;
   font-size: 17px;
 }
@@ -229,9 +241,9 @@ h1 {
 }
 
 .scenario-label {
-  border: 1px dashed #53677a;
+  border: 1px dashed #3a5545;
   padding: 8px 10px;
-  color: #9db0c2;
+  color: #8fad9a;
   font-size: 10px;
 }
 
@@ -244,7 +256,7 @@ h1 {
 .metric-card {
   padding: 22px;
   border: 1px solid var(--line);
-  background: linear-gradient(145deg, rgba(16, 33, 53, 0.86), rgba(10, 24, 39, 0.9));
+  background: linear-gradient(145deg, rgba(15, 28, 20, 0.9), rgba(6, 16, 10, 0.92));
   min-height: 150px;
 }
 
@@ -290,17 +302,17 @@ h1 {
   grid-template-columns: 62px minmax(0, 1fr) 150px;
   gap: 22px;
   border: 1px solid var(--line);
-  background: rgba(12, 25, 41, 0.82);
+  background: rgba(10, 20, 14, 0.86);
   padding: 22px;
 }
 
 .recommendation.top {
-  border-color: rgba(101, 230, 255, 0.7);
-  box-shadow: 0 0 32px rgba(101, 230, 255, 0.06);
+  border-color: rgba(45, 255, 106, 0.7);
+  box-shadow: 0 0 36px rgba(45, 255, 106, 0.12);
 }
 
 .rank {
-  color: #60758a;
+  color: #5f7a69;
   font-size: 20px;
 }
 
@@ -316,7 +328,7 @@ h1 {
 
 .recommendation-body p,
 .timeline-card p {
-  color: #aebfce;
+  color: #a8c4b4;
   line-height: 1.55;
   margin: 0 0 14px;
 }
@@ -341,18 +353,18 @@ h1 {
 .badge.mixed,
 .evidence.fact {
   color: var(--green);
-  border-color: rgba(82, 242, 177, 0.45);
-  background: rgba(82, 242, 177, 0.07);
+  border-color: rgba(45, 255, 106, 0.45);
+  background: rgba(45, 255, 106, 0.08);
 }
 
 .badge.scenario {
-  color: #9db0c2;
-  border-color: #43596d;
+  color: #8fad9a;
+  border-color: #355044;
 }
 
 .evidence.inference {
   color: var(--violet);
-  border-color: rgba(181, 156, 255, 0.45);
+  border-color: rgba(142, 217, 176, 0.45);
 }
 
 .evidence.recommendation {
@@ -367,9 +379,9 @@ h1 {
 
 .evidence-chip {
   font-family: "DM Mono", monospace;
-  color: #8299ad;
+  color: #7f9a88;
   font-size: 9px;
-  border: 1px solid #263d53;
+  border: 1px solid #1c3326;
   padding: 4px 6px;
 }
 
@@ -398,8 +410,8 @@ h1 {
 
 .data-note {
   border-left: 3px solid var(--amber);
-  color: #b8c7d5;
-  background: rgba(255, 189, 102, 0.05);
+  color: #a8c4b4;
+  background: rgba(224, 195, 106, 0.06);
   padding: 14px 16px;
   font-size: 12px;
   line-height: 1.6;
@@ -408,10 +420,11 @@ h1 {
 .primary-action,
 .run-button {
   border: 0;
-  background: var(--cyan);
-  color: #031019;
+  background: linear-gradient(120deg, var(--neon) 0%, var(--mint) 100%);
+  color: #031208;
   font-weight: 700;
   cursor: pointer;
+  box-shadow: 0 0 24px rgba(45, 255, 106, 0.22);
 }
 
 .primary-action {
@@ -426,7 +439,7 @@ h1 {
 .task-hero {
   padding: 28px;
   border: 1px solid var(--line);
-  background: linear-gradient(120deg, rgba(13, 41, 61, 0.95), rgba(12, 25, 41, 0.8));
+  background: linear-gradient(120deg, rgba(10, 36, 20, 0.95), rgba(10, 20, 14, 0.82));
 }
 
 .task-hero p {
@@ -446,7 +459,7 @@ h1 {
 
 .empty-demo,
 .loading-card {
-  border: 1px dashed #38516a;
+  border: 1px dashed #355044;
   min-height: 280px;
   display: grid;
   place-items: center;
@@ -457,7 +470,7 @@ h1 {
 }
 
 .empty-demo h3 {
-  color: #dbe8f2;
+  color: #e8f7ee;
   margin-bottom: 0;
 }
 
@@ -503,8 +516,8 @@ h1 {
 }
 
 .tool-proof {
-  border: 1px solid rgba(82, 242, 177, 0.35);
-  background: rgba(6, 20, 31, 0.86);
+  border: 1px solid rgba(45, 255, 106, 0.35);
+  background: rgba(4, 14, 8, 0.9);
   padding: 22px;
 }
 
@@ -536,7 +549,7 @@ h1 {
 
 .proof-status.ready {
   color: var(--green);
-  border-color: rgba(82, 242, 177, 0.55);
+  border-color: rgba(45, 255, 106, 0.55);
 }
 
 .proof-status.blocked {
@@ -551,16 +564,17 @@ h1 {
 }
 
 .terminal {
-  border: 1px solid #253c50;
-  background: #030a11;
+  border: 1px solid #1c3326;
+  background: #010403;
   min-height: 128px;
+  box-shadow: inset 0 0 40px rgba(45, 255, 106, 0.03);
 }
 
 .terminal-label {
   font-family: "DM Mono", monospace;
   font-size: 9px;
   letter-spacing: 0.08em;
-  border-bottom: 1px solid #253c50;
+  border-bottom: 1px solid #1c3326;
   padding: 8px 10px;
 }
 
@@ -569,19 +583,20 @@ h1 {
 }
 
 .pass-output {
-  color: var(--green);
+  color: var(--neon);
+  text-shadow: 0 0 12px rgba(45, 255, 106, 0.25);
 }
 
 .terminal pre {
   white-space: pre-wrap;
   margin: 0;
   padding: 14px;
-  color: #b9cad8;
+  color: #b8ffd4;
   font: 11px/1.6 "DM Mono", monospace;
 }
 
 .manifest-path {
-  color: #70879b;
+  color: #6f8a79;
   font: 9px/1.5 "DM Mono", monospace;
   margin-top: 12px;
   word-break: break-all;
@@ -592,7 +607,7 @@ h1 {
   justify-content: space-between;
   gap: 12px;
   align-items: center;
-  color: #8aa0b3;
+  color: #7f9a88;
   font: 11px/1.5 "DM Mono", monospace;
   margin: 8px 0 18px;
   flex-wrap: wrap;
@@ -613,8 +628,8 @@ h1 {
 .upload-drop {
   position: relative;
   display: block;
-  border: 1px dashed #3a5770;
-  background: rgba(16, 33, 53, 0.72);
+  border: 1px dashed #355044;
+  background: rgba(15, 28, 20, 0.72);
   padding: 22px 20px;
   cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
@@ -622,7 +637,7 @@ h1 {
 
 .upload-drop:hover {
   border-color: var(--cyan);
-  background: rgba(16, 33, 53, 0.95);
+  background: rgba(15, 28, 20, 0.95);
 }
 
 .upload-input {
@@ -650,9 +665,9 @@ h1 {
 }
 
 .secondary-action {
-  border: 1px solid #3a5770;
+  border: 1px solid #355044;
   background: transparent;
-  color: #d7e6f3;
+  color: #e8f7ee;
   padding: 10px 14px;
   cursor: pointer;
 }
@@ -663,14 +678,14 @@ h1 {
 }
 
 .upload-status {
-  border: 1px solid #3a5770;
+  border: 1px solid #355044;
   padding: 12px 14px;
   display: grid;
   gap: 6px;
 }
 
 .upload-status.ok {
-  border-color: rgba(82, 242, 177, 0.45);
+  border-color: rgba(45, 255, 106, 0.45);
 }
 
 .upload-status.blocked {
@@ -706,13 +721,13 @@ h1 {
   display: grid;
   gap: 6px;
   font-size: 12px;
-  color: #9eb2c3;
+  color: #8fad9a;
 }
 
 .status-pill {
   display: inline-flex;
   width: fit-content;
-  border: 1px solid #3a5770;
+  border: 1px solid #355044;
   padding: 4px 8px;
   font: 10px/1 "DM Mono", monospace;
   letter-spacing: 0.04em;
@@ -720,7 +735,7 @@ h1 {
 
 .status-pill.passed {
   color: var(--green);
-  border-color: rgba(92, 214, 158, 0.55);
+  border-color: rgba(45, 255, 106, 0.55);
 }
 
 .status-pill.verification_failed {
@@ -739,7 +754,7 @@ h1 {
 .failure-box,
 .hypothesis-box,
 .artifact-box {
-  border-left: 2px solid #3a5770;
+  border-left: 2px solid #355044;
   padding-left: 12px;
   display: grid;
   gap: 4px;
@@ -750,7 +765,7 @@ h1 {
 }
 
 .hypothesis-box {
-  border-left-color: #7eb6ff;
+  border-left-color: #8ed9b0;
 }
 
 .artifact-box {
@@ -758,8 +773,8 @@ h1 {
 }
 
 .coverage-panel {
-  border: 1px solid rgba(101, 230, 255, 0.32);
-  background: rgba(9, 25, 40, 0.82);
+  border: 1px solid rgba(45, 255, 106, 0.32);
+  background: rgba(6, 18, 11, 0.86);
   padding: 20px;
   display: grid;
   gap: 16px;
@@ -810,7 +825,7 @@ h1 {
   width: 100%;
   height: 8px;
   border: 0;
-  background: #14273a;
+  background: #13261a;
   accent-color: var(--cyan);
 }
 
@@ -848,7 +863,7 @@ h1 {
 .timeline-index {
   width: 46px;
   height: 46px;
-  border: 1px solid #3a5770;
+  border: 1px solid #355044;
   background: var(--bg);
   display: grid;
   place-items: center;
@@ -861,18 +876,18 @@ h1 {
   border: 1px solid var(--line);
   padding: 18px 20px;
   margin-bottom: 12px;
-  background: rgba(12, 25, 41, 0.74);
+  background: rgba(10, 20, 14, 0.78);
 }
 
 .timeline-meta {
   gap: 9px;
-  color: #8299ad;
+  color: #7f9a88;
   font-family: "DM Mono", monospace;
   font-size: 10px;
 }
 
 .timeline-meta strong {
-  color: #dbe8f2;
+  color: #e8f7ee;
 }
 
 .timeline-meta .evidence {
@@ -894,7 +909,7 @@ h1 {
 .spinner {
   width: 30px;
   height: 30px;
-  border: 2px solid #2b4358;
+  border: 2px solid #274233;
   border-top-color: var(--cyan);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
