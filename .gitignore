@@ -1,0 +1,9 @@
+.jac/
+runs/*/
+*.vvp
+*.vcd
+obj_dir/
+__pycache__/
+.DS_Store
+.pytest_cache/
+ignore_prep/
