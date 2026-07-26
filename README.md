@@ -1,5 +1,7 @@
 # JacVerify
 
+Graph-native, evidence-driven chip verification orchestrator built with Jac and open-source EDA tools.
+
 JacVerify is an evidence-driven verification decision layer for chip verification teams. It answers two connected questions:
 
 1. **Project view:** Which verification action is most valuable next, given risk, evidence, urgency, and compute cost?
