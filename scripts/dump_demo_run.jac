@@ -10,8 +10,24 @@ with entry {
     print("WALKERS", result.walker_log);
     print("FAIL", result.failure_kind, result.failure_expected, result.failure_observed);
     print("HYP", result.top_hypothesis);
+    print(
+        "DEBUG",
+        f"attempt={result.debug_attempt}/{result.max_debug_attempts}",
+        f"selected_rank={result.selected_hypothesis_rank}"
+    );
     print("CAND", result.candidate_applied, result.candidate_label);
     print("REVERIFY", result.reverify_status);
+    print(
+        "COVERAGE",
+        (
+            f"code={result.code_coverage}% "
+            f"functional={result.functional_coverage}% "
+            f"source={result.coverage_source}"
+        )
+        if result.coverage_available
+        else "N/A"
+    );
+    print("USER_REVIEW", result.needs_user_review, result.stop_reason);
     for t in result.transitions {
         print(
             str(t.sequence)

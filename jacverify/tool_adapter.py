@@ -9,6 +9,8 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,105 +25,11 @@ MISMATCH_RE = re.compile(
     r"(WRAP_MISMATCH|ALU_MISMATCH|SHIFT_MISMATCH)\s+"
     r"expected=([0-9A-Fa-fxX]+)\s+observed=([0-9A-Fa-fxX]+)"
 )
-WRAP_MISMATCH_RE = MISMATCH_RE  # backward-compatible alias
-
-_ACTIVE_CASE_ID = "fifo"
-
-
-@dataclass(frozen=True)
-class CaseConfig:
-    case_id: str
-    title: str
-    description: str
-    module_name: str
-    demo_dir: str
-    buggy_name: str
-    fixed_name: str
-    smoke_tb: str
-    directed_tb: str
-    spec_name: str
-    accepted_filenames: tuple[str, ...]
-    fail_tag: str
-    pass_tag: str
-    mock_fail_stdout: str
-    mock_pass_stdout: str
-
-
-CASE_CONFIGS: dict[str, CaseConfig] = {
-    "fifo": CaseConfig(
-        case_id="fifo",
-        title="FIFO wraparound",
-        description=(
-            "Module-level FIFO with a planted write-pointer wrap bug."
-        ),
-        module_name="fifo",
-        demo_dir="fifo",
-        buggy_name="fifo_buggy.sv",
-        fixed_name="fifo_fixed.sv",
-        smoke_tb="tb_smoke.sv",
-        directed_tb="tb_wrap.sv",
-        spec_name="fifo_spec.md",
-        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
-        fail_tag="WRAP_MISMATCH",
-        pass_tag="WRAP_TEST_PASS",
-        mock_fail_stdout="WRAP_MISMATCH expected=55 observed=33\n",
-        mock_pass_stdout="WRAP_TEST_PASS\n",
-    ),
-    "alu": CaseConfig(
-        case_id="alu",
-        title="ALU subtract opcode",
-        description=(
-            "Small ALU where SUB incorrectly adds instead of subtracts."
-        ),
-        module_name="alu",
-        demo_dir="alu",
-        buggy_name="alu_buggy.sv",
-        fixed_name="alu_fixed.sv",
-        smoke_tb="tb_smoke.sv",
-        directed_tb="tb_directed.sv",
-        spec_name="alu_spec.md",
-        accepted_filenames=("alu_buggy.sv", "alu.sv"),
-        fail_tag="ALU_MISMATCH",
-        pass_tag="ALU_TEST_PASS",
-        mock_fail_stdout="ALU_MISMATCH expected=05 observed=0b\n",
-        mock_pass_stdout="ALU_TEST_PASS\n",
-    ),
-    "shift_reg": CaseConfig(
-        case_id="shift_reg",
-        title="Shift-register direction",
-        description=(
-            "Shift register that shifts left instead of the specified right shift."
-        ),
-        module_name="shift_reg",
-        demo_dir="shift_reg",
-        buggy_name="shift_reg_buggy.sv",
-        fixed_name="shift_reg_fixed.sv",
-        smoke_tb="tb_smoke.sv",
-        directed_tb="tb_directed.sv",
-        spec_name="shift_reg_spec.md",
-        accepted_filenames=("shift_reg_buggy.sv", "shift_reg.sv"),
-        fail_tag="SHIFT_MISMATCH",
-        pass_tag="SHIFT_TEST_PASS",
-        mock_fail_stdout="SHIFT_MISMATCH expected=40 observed=00\n",
-        mock_pass_stdout="SHIFT_TEST_PASS\n",
-    ),
-}
-
-
-def set_active_case(case_id: str) -> str:
-    global _ACTIVE_CASE_ID
-    if case_id not in CASE_CONFIGS:
-        raise ValueError(f"Unknown curated case_id: {case_id}")
-    _ACTIVE_CASE_ID = case_id
-    return case_id
-
-
-def get_active_case_id() -> str:
-    return _ACTIVE_CASE_ID
-
-
-def active_case() -> CaseConfig:
-    return CASE_CONFIGS[_ACTIVE_CASE_ID]
+COVERAGE_RE = re.compile(
+    r"JACVERIFY_COVERAGE\s+code=([0-9]+(?:\.[0-9]+)?)"
+    r"\s+functional=([0-9]+(?:\.[0-9]+)?)"
+)
+MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
 
 
 @dataclass(frozen=True)
@@ -164,6 +72,23 @@ class SpecLoadResult:
     mode: str
 
 
+@dataclass(frozen=True)
+class CoverageResult:
+    available: bool
+    code_coverage: float
+    functional_coverage: float
+    source: str
+
+
+@dataclass(frozen=True)
+class UploadedInputPaths:
+    design_path: str
+    spec_path: str
+    test_path: str
+    design_module: str
+    test_module: str
+
+
 # Backward-compatible aliases used by older tests during migration.
 ToolRun = ToolResult
 
@@ -186,6 +111,11 @@ def tools_mode() -> str:
 
 def llm_mode() -> str:
     return "mock" if os.environ.get("JACVERIFY_MOCK_LLM", "1") == "1" else "live"
+
+
+def llm_backend() -> str:
+    """Select the live inference adapter without affecting deterministic mock mode."""
+    return os.environ.get("JACVERIFY_LLM_BACKEND", "firecrawl").strip().lower()
 
 
 def _tool_error(
@@ -241,10 +171,26 @@ def _fifo_paths(workspace_root: str) -> dict[str, Path]:
 
 
 def load_spec(workspace_root: str) -> SpecLoadResult:
-    cfg = active_case()
-    paths = _case_paths(workspace_root, cfg)
+    paths = _fifo_paths(workspace_root)
+    return load_uploaded_spec(
+        str(paths["spec_path"]),
+        str(paths["buggy_rtl"]),
+        "fifo",
+    )
+
+
+def load_uploaded_spec(
+    spec_path: str,
+    module_path: str,
+    module_name: str,
+) -> SpecLoadResult:
+    """Load requirements from an uploaded spec, with a plain-text fallback."""
+    path = Path(spec_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Uploaded specification is missing: {path}")
+    spec_text = path.read_text(encoding="utf-8")
     requirements: list[RequirementItem] = []
-    for line in paths["spec_path"].read_text(encoding="utf-8").splitlines():
+    for line in spec_text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("- REQ-"):
             continue
@@ -256,31 +202,72 @@ def load_spec(workspace_root: str) -> SpecLoadResult:
                 text=text.strip() or body,
             )
         )
-    if len(requirements) != 5:
-        raise ValueError(
-            f"{cfg.case_id} specification must contain exactly five requirements"
+    if not requirements:
+        fallback = " ".join(
+            line.strip().lstrip("#").strip()
+            for line in spec_text.splitlines()
+            if line.strip()
+        )
+        if not fallback:
+            raise ValueError("Uploaded specification is empty")
+        requirements.append(
+            RequirementItem(
+                req_id="REQ-SPEC",
+                text=fallback[:1000],
+            )
         )
     return SpecLoadResult(
         requirement_count=len(requirements),
-        spec_path=str(paths["spec_path"]),
+        spec_path=str(path),
         requirements=requirements,
-        module_path=str(paths["buggy_rtl"]),
-        module_name=cfg.module_name,
+        module_path=module_path,
+        module_name=module_name,
         mode=tools_mode(),
     )
 
 
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
-    match = MISMATCH_RE.search(result.stdout or "")
-    if not match:
-        return None
-    return FailureEvidence(
-        kind=match.group(1),
-        expected=match.group(2),
-        observed=match.group(3),
-        cycle=None,
-        raw_stdout=result.stdout,
-        source_result=result,
+    match = WRAP_MISMATCH_RE.search(result.stdout or "")
+    if match:
+        return FailureEvidence(
+            kind="WRAP_MISMATCH",
+            expected=match.group(1),
+            observed=match.group(2),
+            cycle=None,
+            raw_stdout=result.stdout,
+            source_result=result,
+        )
+    if result.status == STATUS_VERIFICATION_FAILED:
+        return FailureEvidence(
+            kind="TEST_FAILURE",
+            expected=None,
+            observed=None,
+            cycle=None,
+            raw_stdout=result.stdout or result.stderr,
+            source_result=result,
+        )
+    return None
+
+
+def coverage_from_result(result: ToolResult) -> CoverageResult:
+    matches = list(COVERAGE_RE.finditer(result.stdout or ""))
+    if not matches:
+        return CoverageResult(
+            available=False,
+            code_coverage=0.0,
+            functional_coverage=0.0,
+            source="not_reported",
+        )
+    match = matches[-1]
+    return CoverageResult(
+        available=True,
+        code_coverage=min(100.0, max(0.0, float(match.group(1)))),
+        functional_coverage=min(100.0, max(0.0, float(match.group(2)))),
+        source=(
+            "mock:testbench_marker"
+            if result.mode == "mock"
+            else "testbench_marker"
+        ),
     )
 
 
@@ -368,6 +355,10 @@ def _mock_smoke() -> ToolResult:
 def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
     cfg = active_case()
     if reproduce_bug:
+        stdout = (
+            "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
+            "WRAP_MISMATCH expected=55 observed=33\n"
+        )
         return ToolResult(
             tool="vvp",
             mode="mock",
@@ -391,7 +382,10 @@ def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
         exit_code=0,
         command=["mock:vvp", "directed_regression.vvp"],
         duration_ms=2,
-        stdout=cfg.mock_pass_stdout,
+        stdout=(
+            "JACVERIFY_COVERAGE code=88.0 functional=100.0\n"
+            "WRAP_TEST_PASS\n"
+        ),
         stderr="",
         artifacts=["mock:directed_regression.vvp"],
         diagnostics={
@@ -413,7 +407,10 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
             exit_code=0,
             command=["mock:vvp", "patched_reverify.vvp"],
             duration_ms=2,
-            stdout=cfg.mock_pass_stdout,
+            stdout=(
+                "JACVERIFY_COVERAGE code=91.0 functional=100.0\n"
+                "WRAP_TEST_PASS\n"
+            ),
             stderr="",
             artifacts=["mock:patched_reverify.vvp"],
             diagnostics={
@@ -430,7 +427,10 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
         exit_code=1,
         command=["mock:vvp", "patched_reverify.vvp"],
         duration_ms=2,
-        stdout=cfg.mock_fail_stdout,
+        stdout=(
+            "JACVERIFY_COVERAGE code=78.0 functional=66.7\n"
+            "WRAP_MISMATCH expected=55 observed=33\n"
+        ),
         stderr="",
         artifacts=["mock:patched_reverify.vvp"],
         diagnostics={
@@ -501,8 +501,61 @@ def _ensure_output_dir(output_dir: str) -> Path:
     return artifacts
 
 
-def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
-    cfg = active_case()
+def _safe_upload_name(filename: str, fallback: str) -> str:
+    basename = Path(filename or "").name.strip()
+    if not basename or basename in {".", ".."}:
+        return fallback
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", basename)
+
+
+def _module_name(source: str, label: str) -> str:
+    match = MODULE_RE.search(source)
+    if not match:
+        raise ValueError(f"{label} does not declare a SystemVerilog module")
+    return match.group(1)
+
+
+def materialize_uploaded_inputs(
+    workspace_root: str,
+    output_dir: str,
+    design_filename: str,
+    design_content: str,
+    spec_filename: str,
+    spec_content: str,
+) -> UploadedInputPaths:
+    """Write design/spec inputs and inject the prototype generated testbench."""
+    inputs_dir = _ensure_output_dir(output_dir) / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    design_name = _safe_upload_name(design_filename, "design.sv")
+    spec_name = _safe_upload_name(spec_filename, "spec.md")
+    test_name = "generated_tb_wrap.sv"
+    design_path = inputs_dir / design_name
+    spec_path = inputs_dir / spec_name
+    test_path = inputs_dir / test_name
+    normalized_design = normalize_source(design_content)
+    normalized_spec = normalize_source(spec_content)
+    normalized_test = normalize_source(
+        _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
+    )
+    design_path.write_text(normalized_design, encoding="utf-8")
+    spec_path.write_text(normalized_spec, encoding="utf-8")
+    test_path.write_text(normalized_test, encoding="utf-8")
+    return UploadedInputPaths(
+        design_path=str(design_path),
+        spec_path=str(spec_path),
+        test_path=str(test_path),
+        design_module=_module_name(normalized_design, "Uploaded design"),
+        test_module=_module_name(normalized_test, "Generated testbench"),
+    )
+
+
+def lint_compile(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str = "",
+    test_path: str = "",
+    top_module: str = "",
+) -> ToolResult:
     if tools_mode() == "mock":
         return _mock_compile()
     if shutil.which("iverilog") is None:
@@ -514,20 +567,31 @@ def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
             stderr="iverilog not found on PATH",
             diagnostics={"error": "executable_not_found", "stage": "compile"},
         )
-    paths = _case_paths(workspace_root, cfg)
+    rtl = (
+        Path(design_path).resolve()
+        if design_path
+        else _fifo_paths(workspace_root)["buggy_rtl"]
+    )
+    testbench = Path(test_path).resolve() if test_path else None
     artifacts = _ensure_output_dir(output_dir)
+    command = ["iverilog", "-g2012", "-tnull"]
+    if top_module:
+        command.extend(["-s", top_module])
+    else:
+        command.extend(["-s", "fifo"])
+    command.append(str(rtl))
+    if testbench is not None:
+        command.append(str(testbench))
     result = _execute(
         tool="iverilog",
-        command=[
-            "iverilog",
-            "-g2012",
-            "-tnull",
-            "-s",
-            cfg.module_name,
-            str(paths["buggy_rtl"]),
-        ],
+        command=command,
         cwd=artifacts,
-        diagnostics={"stage": "compile", "case_id": cfg.case_id},
+        diagnostics={
+            "stage": "compile",
+            "design": str(rtl),
+            "test": str(testbench) if testbench is not None else "",
+            "top": top_module or "fifo",
+        },
     )
     if result.status == STATUS_PASSED:
         return result
@@ -553,6 +617,7 @@ def _compile_and_simulate(
     rtl: Path,
     testbench: Path,
     output_dir: Path,
+    top_module: str = "",
 ) -> ToolResult:
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         return _tool_error(
@@ -570,7 +635,7 @@ def _compile_and_simulate(
             "iverilog",
             "-g2012",
             "-s",
-            testbench.stem,
+            top_module or testbench.stem,
             "-o",
             str(binary),
             str(rtl),
@@ -618,7 +683,7 @@ def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
     cfg = active_case()
     if tools_mode() == "mock":
         return _mock_smoke()
-    paths = _case_paths(workspace_root, cfg)
+    paths = _fifo_paths(workspace_root) if not candidate_path or not test_path else {}
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="smoke",
@@ -712,25 +777,139 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
     )
 
 
-def run_reverify(workspace_root: str, output_dir: str) -> ToolResult:
-    cfg = active_case()
+def run_uploaded_test(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    test_path: str,
+) -> ToolResult:
+    """Compile the uploaded design with the test generated for this run."""
     if tools_mode() == "mock":
+        force = os.environ.get("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", "")
+        return _mock_regression(reproduce_bug=force != "1")
+    artifacts = _ensure_output_dir(output_dir)
+    result = _compile_and_simulate(
+        stage="uploaded_test",
+        rtl=Path(design_path).resolve(),
+        testbench=Path(test_path).resolve(),
+        output_dir=artifacts,
+        top_module=_module_name(
+            Path(test_path).read_text(encoding="utf-8"),
+            "Uploaded testbench",
+        ),
+    )
+    diagnostics = {
+        **result.diagnostics,
+        "stage": "uploaded_test",
+        "design": design_path,
+        "test": test_path,
+    }
+    if result.status == STATUS_PASSED and result.exit_code == 0:
+        return ToolResult(
+            tool=result.tool,
+            mode=result.mode,
+            status=STATUS_PASSED,
+            exit_code=result.exit_code,
+            command=result.command,
+            duration_ms=result.duration_ms,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            artifacts=result.artifacts,
+            diagnostics=diagnostics,
+        )
+    if result.diagnostics.get("error"):
+        return result
+    return ToolResult(
+        tool=result.tool,
+        mode=result.mode,
+        status=STATUS_VERIFICATION_FAILED,
+        exit_code=result.exit_code if result.exit_code is not None else 1,
+        command=result.command,
+        duration_ms=result.duration_ms,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        artifacts=result.artifacts,
+        diagnostics=diagnostics,
+    )
+
+
+def run_reverify(
+    workspace_root: str,
+    output_dir: str,
+    attempt: int = 1,
+    test_path: str = "",
+    candidate_path: str = "",
+) -> ToolResult:
+    if tools_mode() == "mock":
+        sequence_raw = os.environ.get("JACVERIFY_REVERIFY_SEQUENCE", "").strip()
+        if sequence_raw:
+            sequence = [
+                item.strip().upper()
+                for item in sequence_raw.split(",")
+                if item.strip()
+            ]
+            if not sequence:
+                return _tool_error(
+                    tool="mock:vvp",
+                    mode="mock",
+                    command=["mock:vvp", "patched_reverify.vvp"],
+                    duration_ms=1,
+                    stderr="JACVERIFY_REVERIFY_SEQUENCE is empty",
+                    diagnostics={"stage": "patched_reverify", "attempt": attempt},
+                )
+            selected = sequence[min(max(attempt, 1) - 1, len(sequence) - 1)]
+            if selected == STATUS_PASSED:
+                return _mock_reverify(pass_result=True)
+            if selected == STATUS_VERIFICATION_FAILED:
+                return _mock_reverify(pass_result=False)
+            if selected == STATUS_TOOL_ERROR:
+                return _tool_error(
+                    tool="mock:vvp",
+                    mode="mock",
+                    command=["mock:vvp", "patched_reverify.vvp"],
+                    duration_ms=1,
+                    stderr="mock reverify tool error",
+                    diagnostics={"stage": "patched_reverify", "attempt": attempt},
+                    exit_code=2,
+                )
+            return _tool_error(
+                tool="mock:vvp",
+                mode="mock",
+                command=["mock:vvp", "patched_reverify.vvp"],
+                duration_ms=1,
+                stderr=f"unsupported mock reverify status: {selected}",
+                diagnostics={"stage": "patched_reverify", "attempt": attempt},
+            )
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
-    paths = _case_paths(workspace_root, cfg)
+    paths = _fifo_paths(workspace_root)
+    candidate = (
+        Path(candidate_path).resolve()
+        if candidate_path and Path(candidate_path).is_absolute()
+        else (
+            (Path(workspace_root).resolve() / candidate_path).resolve()
+            if candidate_path
+            else paths["fixed_rtl"]
+        )
+    )
+    testbench = Path(test_path).resolve() if test_path else paths["wrap_tb"]
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="patched_reverify",
-        rtl=paths["fixed_rtl"],
-        testbench=paths["wrap_tb"],
+        rtl=candidate,
+        testbench=testbench,
         output_dir=artifacts,
+        top_module=_module_name(
+            testbench.read_text(encoding="utf-8"),
+            "Uploaded testbench",
+        ),
     )
     diagnostics = {
         **result.diagnostics,
         "stage": "patched_reverify",
-        "candidate": str(paths["fixed_rtl"]),
+        "candidate": str(candidate),
         "candidate_kind": "reviewed_fixture",
-        "case_id": cfg.case_id,
+        "test": str(testbench),
     }
     if result.status == STATUS_PASSED and cfg.pass_tag in result.stdout:
         return ToolResult(
@@ -896,12 +1075,279 @@ def generate_artifact_mock(
     )
 
 
+def _firecrawl_agent(
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one bounded Firecrawl Agent extraction and return its typed data."""
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "FIRECRAWL_API_KEY is empty. Keep JACVERIFY_MOCK_LLM=1 or put a "
+            "Firecrawl key in the local .env file."
+        )
+
+    base_url = os.environ.get(
+        "FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2"
+    ).rstrip("/")
+    model = os.environ.get("JACVERIFY_FIRECRAWL_MODEL", "spark-1-mini").strip()
+    max_credits = int(os.environ.get("JACVERIFY_FIRECRAWL_MAX_CREDITS", "100"))
+    timeout_seconds = int(
+        os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "60")
+    )
+    poll_seconds = float(
+        os.environ.get("JACVERIFY_FIRECRAWL_POLL_SECONDS", "2")
+    )
+
+    if model not in {"spark-1-mini", "spark-1-pro"}:
+        raise RuntimeError(f"Unsupported Firecrawl Agent model: {model}")
+    if not 1 <= max_credits <= 2500:
+        raise RuntimeError("JACVERIFY_FIRECRAWL_MAX_CREDITS must be 1..2500")
+    if not 5 <= timeout_seconds <= 300:
+        raise RuntimeError("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS must be 5..300")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "JacVerify/0.1",
+    }
+
+    def request_json(
+        url: str,
+        *,
+        method: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body = (
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            if payload is not None
+            else None
+        )
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(
+                f"Firecrawl HTTP {exc.code}: {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Firecrawl connection failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Firecrawl returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Firecrawl returned a non-object response")
+        return decoded
+
+    started = request_json(
+        f"{base_url}/agent",
+        method="POST",
+        payload={
+            "prompt": prompt[:10000],
+            "schema": schema,
+            "maxCredits": max_credits,
+            "model": model,
+        },
+    )
+    job_id = started.get("id")
+    if started.get("success") is not True or not isinstance(job_id, str):
+        raise RuntimeError(
+            f"Firecrawl did not start an agent job: {started.get('error', started)}"
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = request_json(f"{base_url}/agent/{job_id}", method="GET")
+        state = status.get("status")
+        if state == "completed":
+            data = status.get("data")
+            if not isinstance(data, dict):
+                raise RuntimeError("Firecrawl completed without object data")
+            return data
+        if state == "failed":
+            raise RuntimeError(
+                f"Firecrawl agent failed: {status.get('error', 'unknown error')}"
+            )
+        if state != "processing":
+            raise RuntimeError(f"Unexpected Firecrawl agent status: {state!r}")
+        time.sleep(poll_seconds)
+
+    raise RuntimeError(
+        f"Firecrawl agent timed out after {timeout_seconds}s"
+    )
+
+
+def rank_hypotheses_firecrawl(
+    failure: FailureEvidence,
+) -> list[HypothesisDraft]:
+    """Experimental use of Firecrawl Agent as a constrained RTL reasoner."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "hypotheses": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "rank": {"type": "integer", "minimum": 1, "maximum": 3},
+                        "claim": {"type": "string"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "next_action": {"type": "string"},
+                    },
+                    "required": [
+                        "rank",
+                        "claim",
+                        "confidence",
+                        "next_action",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["hypotheses"],
+        "additionalProperties": False,
+    }
+    data = _firecrawl_agent(
+        prompt=(
+            "Do not browse the web. Use only the evidence below. Act as a "
+            "conservative RTL verification engineer. Return exactly three "
+            "distinct, falsifiable FIFO root-cause hypotheses. Never declare "
+            "PASS and never invent waveform facts.\n\n"
+            "Requirements:\n"
+            "- Reset leaves the FIFO empty and write-ready.\n"
+            "- Values preserve FIFO ordering.\n"
+            "- Exactly DEPTH entries are accepted before full.\n"
+            "- Empty reads do not advance read_ptr.\n"
+            "- Simultaneous accepted read/write preserves occupancy.\n\n"
+            f"Failure kind: {failure.kind}\n"
+            f"Expected: {failure.expected or ''}\n"
+            f"Observed: {failure.observed or ''}\n"
+            f"Cycle: {failure.cycle if failure.cycle is not None else ''}\n"
+            f"Simulator output:\n{failure.raw_stdout[-4000:]}"
+        ),
+        schema=schema,
+    )
+    items = data.get("hypotheses")
+    if not isinstance(items, list) or len(items) != 3:
+        raise RuntimeError("Firecrawl must return exactly three hypotheses")
+
+    drafts: list[HypothesisDraft] = []
+    seen_ranks: set[int] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise RuntimeError("Firecrawl returned a malformed hypothesis")
+        rank = int(raw.get("rank", 0))
+        confidence = float(raw.get("confidence", -1))
+        claim = str(raw.get("claim", "")).strip()
+        next_action = str(raw.get("next_action", "")).strip()
+        if (
+            rank not in {1, 2, 3}
+            or rank in seen_ranks
+            or not 0 <= confidence <= 1
+            or not claim
+            or not next_action
+        ):
+            raise RuntimeError("Firecrawl returned an invalid hypothesis")
+        seen_ranks.add(rank)
+        drafts.append(
+            HypothesisDraft(
+                rank=rank,
+                claim=claim,
+                confidence=confidence,
+                next_action=next_action,
+            )
+        )
+    return sorted(drafts, key=lambda item: item.rank)
+
+
+def generate_artifact_firecrawl(
+    hypothesis: HypothesisDraft,
+    module_name: str,
+) -> ArtifactDraft:
+    """Ask Firecrawl for a plan while retaining a hard-coded reviewed path."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "directed_test",
+                    "sva_assertion",
+                    "reviewed_rtl_candidate",
+                ],
+            },
+            "description": {"type": "string"},
+            "verification_goal": {"type": "string"},
+            "rationale": {"type": "string"},
+        },
+        "required": [
+            "kind",
+            "description",
+            "verification_goal",
+            "rationale",
+        ],
+        "additionalProperties": False,
+    }
+    data = _firecrawl_agent(
+        prompt=(
+            "Do not browse the web. Use only the hypothesis below. Propose one "
+            "minimal FIFO verification artifact. Do not return code, paths, "
+            "shell commands, or a PASS/FAIL verdict. Prefer a directed "
+            "wraparound test or focused assertion.\n\n"
+            f"Module: {module_name}\n"
+            f"Hypothesis: {hypothesis.claim}\n"
+            f"Confidence: {hypothesis.confidence}\n"
+            f"Suggested action: {hypothesis.next_action}"
+        ),
+        schema=schema,
+    )
+    kind = str(data.get("kind", "")).strip()
+    description = str(data.get("description", "")).strip()
+    verification_goal = str(data.get("verification_goal", "")).strip()
+    rationale = str(data.get("rationale", "")).strip()
+    if (
+        kind
+        not in {"directed_test", "sva_assertion", "reviewed_rtl_candidate"}
+        or not description
+        or not verification_goal
+        or not rationale
+    ):
+        raise RuntimeError("Firecrawl returned an invalid artifact proposal")
+    return ArtifactDraft(
+        kind=f"firecrawl_{kind}",
+        description=f"{description} Verification goal: {verification_goal}",
+        candidate_path="demo/fifo/fifo_fixed.sv",
+        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        hypothesis_claim=hypothesis.claim,
+        notes=(
+            f"{rationale} Firecrawl cannot choose or write the RTL path; "
+            "JacVerify re-verifies the checked-in reviewed fixture."
+        ),
+    )
+
+
 def rank_hypotheses(failure: FailureEvidence) -> list[HypothesisDraft]:
     if llm_mode() == "mock":
         return rank_hypotheses_mock(failure)
+    if llm_backend() == "firecrawl":
+        return rank_hypotheses_firecrawl(failure)
     raise RuntimeError(
-        "Live LLM mode requested (JACVERIFY_MOCK_LLM!=1) but no live byllm "
-        "backend is configured for this hackathon build. Set JACVERIFY_MOCK_LLM=1."
+        "Live hypothesis ranking is Jac-native; call "
+        "rank_hypotheses_for_run in jacverify/store.jac. This Python adapter "
+        "only owns the deterministic mock implementation."
     )
 
 
@@ -911,9 +1357,12 @@ def generate_artifact(
 ) -> ArtifactDraft:
     if llm_mode() == "mock":
         return generate_artifact_mock(hypothesis, module_name)
+    if llm_backend() == "firecrawl":
+        return generate_artifact_firecrawl(hypothesis, module_name)
     raise RuntimeError(
-        "Live LLM mode requested (JACVERIFY_MOCK_LLM!=1) but no live byllm "
-        "backend is configured for this hackathon build. Set JACVERIFY_MOCK_LLM=1."
+        "Live artifact proposal is Jac-native; call "
+        "generate_artifact_for_run in jacverify/store.jac. This Python adapter "
+        "only owns the deterministic mock implementation."
     )
 
 
@@ -950,6 +1399,26 @@ def make_hypothesis_draft(
     )
 
 
+def make_artifact_draft(
+    *,
+    kind: str,
+    description: str,
+    candidate_path: str,
+    candidate_label: str,
+    hypothesis_claim: str,
+    notes: str,
+) -> ArtifactDraft:
+    """Build the Python DTO after Jac validates the typed LLM response."""
+    return ArtifactDraft(
+        kind=kind,
+        description=description,
+        candidate_path=candidate_path,
+        candidate_label=candidate_label,
+        hypothesis_claim=hypothesis_claim,
+        notes=notes,
+    )
+
+
 def fresh_run_id(prefix: str = "fifo-run") -> str:
     return f"{prefix}-{int(time.time() * 1000)}"
 
@@ -968,6 +1437,8 @@ class CuratedCase:
     title: str
     description: str
     buggy_relpath: str
+    spec_relpath: str
+    test_relpath: str
     accepted_filenames: tuple[str, ...]
 
 
@@ -978,6 +1449,8 @@ class UploadMatch:
     case_title: str
     message: str
     filename: str
+    spec_filename: str = ""
+    generated_test_filename: str = "generated_tb_wrap.sv"
 
 
 CURATED_CASES: tuple[CuratedCase, ...] = tuple(
@@ -988,10 +1461,11 @@ CURATED_CASES: tuple[CuratedCase, ...] = tuple(
             f"{cfg.description} Hackathon demo uses a reviewed fix fixture "
             "for re-verification."
         ),
-        buggy_relpath=f"demo/{cfg.demo_dir}/{cfg.buggy_name}",
-        accepted_filenames=cfg.accepted_filenames,
-    )
-    for cfg in CASE_CONFIGS.values()
+        buggy_relpath="demo/fifo/fifo_buggy.sv",
+        spec_relpath="demo/fifo/fifo_spec.md",
+        test_relpath="demo/fifo/tb_wrap.sv",
+        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
+    ),
 )
 
 
@@ -1002,6 +1476,8 @@ def list_curated_cases() -> list[dict[str, str]]:
             "title": case.title,
             "description": case.description,
             "buggy_relpath": case.buggy_relpath,
+            "spec_relpath": case.spec_relpath,
+            "test_relpath": case.test_relpath,
             "accepted_filenames": ", ".join(case.accepted_filenames),
         }
         for case in CURATED_CASES
@@ -1065,6 +1541,84 @@ def identify_uploaded_case(
             "or demo/shift_reg/shift_reg_buggy.sv."
         ),
         filename=basename,
+    )
+
+
+def identify_uploaded_inputs(
+    workspace_root: str,
+    design_filename: str,
+    design_content: str,
+    spec_filename: str,
+    spec_content: str,
+) -> UploadMatch:
+    """Validate design/spec inputs and recognize optional curated fixtures."""
+    design_basename = _safe_upload_name(design_filename, "design.sv")
+    spec_basename = _safe_upload_name(spec_filename, "spec.md")
+    if not design_content or not design_content.strip():
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message="Upload an RTL design file to continue.",
+            filename=design_basename,
+            spec_filename=spec_basename,
+        )
+    if not spec_content or not spec_content.strip():
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message="Upload a specification file to continue.",
+            filename=design_basename,
+            spec_filename=spec_basename,
+        )
+    try:
+        _module_name(design_content, "Uploaded design")
+    except ValueError as exc:
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message=str(exc),
+            filename=design_basename,
+            spec_filename=spec_basename,
+        )
+
+    design_fp = source_fingerprint(design_content)
+    spec_fp = source_fingerprint(spec_content)
+    for case in CURATED_CASES:
+        root = Path(workspace_root).resolve()
+        design_path = root / case.buggy_relpath
+        spec_path = root / case.spec_relpath
+        if not design_path.is_file() or not spec_path.is_file():
+            continue
+        if (
+            design_fp == source_fingerprint(design_path.read_text(encoding="utf-8"))
+            and spec_fp == source_fingerprint(spec_path.read_text(encoding="utf-8"))
+        ):
+            return UploadMatch(
+                accepted=True,
+                case_id=case.case_id,
+                case_title=case.title,
+                message=(
+                    f"Ready: `{design_basename}` and `{spec_basename}` match "
+                    "the reviewed FIFO fixture. JacVerify will generate the "
+                    "prototype wraparound testbench."
+                ),
+                filename=design_basename,
+                spec_filename=spec_basename,
+            )
+
+    return UploadMatch(
+        accepted=True,
+        case_id="uploaded",
+        case_title="Spec-driven design verification",
+        message=(
+            f"Ready: `{design_basename}` will be checked against "
+            f"`{spec_basename}` using the prototype generated FIFO testbench."
+        ),
+        filename=design_basename,
+        spec_filename=spec_basename,
     )
 
 

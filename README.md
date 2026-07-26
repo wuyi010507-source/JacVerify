@@ -14,50 +14,52 @@ LoadInputsWalker
 → ReverifyAndRenderWalker
 ```
 
+The last two walkers can repeat for up to three ranked hypotheses. A known
+`VERIFICATION_FAILED` result rejects the current hypothesis and selects the
+next one. Three failures—or any unknown/tool-error condition—stop at
+`NEEDS_USER_REVIEW`.
+
 ## Modes
 
 | Variable | `1` | `0` / unset |
 |---|---|---|
 | `JACVERIFY_MOCK_TOOLS` | Deterministic mock tool adapters | Live Icarus Verilog (`iverilog` / `vvp`) |
-| `JACVERIFY_MOCK_LLM` | Deterministic mock diagnosis / artifact | Live LLM (not configured in this build; set to `1`) |
+| `JACVERIFY_MOCK_LLM` | Deterministic mock diagnosis / artifact | Live adapter selected by `JACVERIFY_LLM_BACKEND` |
+
+The current experimental live backend is Firecrawl Agent (`spark-1-mini`).
+Jac byLLM remains available as the fallback backend.
 
 Mock adapters replace tool/LLM backends. They do **not** bypass walkers, graph updates, or transition logging.
 
 There is **no silent fallback** from live tools to mock when a simulator is missing. Live mode returns `TOOL_ERROR` and the pipeline stops.
 
-## Dependencies
+## Local dependency setup
 
-### Python / Jac (pip + jac)
+Jac and cocotb use separate Python runtimes in this project:
 
-```bash
-jac install
-pip install -r requirements.txt
-```
-
-`requirements.txt` lists Python packages only.
-
-### Icarus Verilog (system package — not pip)
-
-`iverilog` / `vvp` are native binaries. They **cannot** be installed via `requirements.txt`.
-
-| Environment | Install |
-|---|---|
-| Local macOS | `brew install icarus-verilog` |
-| Local Ubuntu/Debian | `sudo apt-get install -y iverilog` |
-| Deployed server / Docker | Install the same OS package in the image or host; ensure `iverilog` and `vvp` are on `PATH` |
-
-- **Local live tool runs:** yes, install Icarus on your machine.
-- **Deployed live tool runs:** yes, install Icarus on every runtime that sets `JACVERIFY_MOCK_TOOLS=0`.
-- **Mock tool mode:** no Icarus needed (`JACVERIFY_MOCK_TOOLS=1`).
-
-Check:
+- Jac 0.34.7 uses its bundled Python 3.14 runtime.
+- cocotb 2.0.x supports Python through 3.13, so it lives in the repository's
+  host-Python `.venv`.
+- cocotb 2.0.x requires Verilator 5.036 or newer. This setup was verified with
+  Verilator 5.050 on macOS ARM64.
+- Icarus Verilog remains the live fallback used by the current adapter.
 
 ```bash
-iverilog -V
-vvp -V
+# Jac application, test, and React/Vite dependencies
+jac install --dev
+jac install byllm
+
+# Verilator/cocotb environment (use Python 3.9-3.13)
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-eda.txt
+
+jac --version
+verilator --version
+.venv/bin/cocotb-config --version
 ```
 
-Current simulator integration: **Icarus Verilog** (`iverilog` + `vvp`), not Verilator/cocotb.
+On macOS, pass `CXXFLAGS=-std=c++17` when building Verilator through the
+cocotb runner.
 
 ## Fully mocked mode (no simulator, no API key)
 
@@ -73,14 +75,42 @@ Open [http://localhost:8000](http://localhost:8000).
 
 Upload path (product UX):
 
-1. Choose one of `demo/fifo/fifo_buggy.sv`, `demo/alu/alu_buggy.sv`, or
-   `demo/shift_reg/shift_reg_buggy.sv` in **Design upload**, or click **Use curated sample** (FIFO).
-2. Click **Run verification loop**.
-3. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
+1. Choose an RTL module in **Design RTL**.
+2. Choose its requirements document in **Specification**.
+3. Click **Run verification loop**, or use the curated FIFO design/spec pair.
+4. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
 
-Uploads are real file reads. Execution is allow-listed to curated hackathon cases so the demo stays reliable. Unknown RTL is rejected with an explicit message (no silent fallback).
+The design and spec are saved under that run's isolated
+`runs/<run-id>/inputs/` directory. The current prototype generates
+`generated_tb_wrap.sv` from the checked-in FIFO wraparound test fixture; this
+hardcoded step will later be replaced by spec-driven generation. Automatic
+candidate application remains restricted to reviewed fixtures.
+
+Coverage is optional and generated-test-owned. A testbench can publish both
+metrics with:
+
+```systemverilog
+$display("JACVERIFY_COVERAGE code=82.5 functional=75.0");
+```
+
+JacVerify parses the last such marker and displays code and functional
+coverage. If the test does not report coverage, the UI shows `N/A` rather than
+inventing a value. Mock results are explicitly labeled `mock:testbench_marker`.
+
+For a terminal-only demo:
+
+```bash
+scripts/run_demo.sh --mock
+scripts/run_demo.sh --firecrawl
+scripts/run_demo.sh --live-tools
+```
+
+`--firecrawl` is the default and uses mock EDA evidence with live Firecrawl
+inference. Use `--live-tools` only after that succeeds.
 
 ## Live simulator with deterministic LLM
+
+Requires Icarus Verilog (verified with 12.0):
 
 ```bash
 brew install icarus-verilog   # once, locally
@@ -89,6 +119,26 @@ JACVERIFY_MOCK_TOOLS=0 \
 JACVERIFY_MOCK_LLM=1 \
 jac start --dev main.jac
 ```
+
+Current simulator integration: **Icarus Verilog** (`iverilog` + `vvp`), not Verilator/cocotb.
+
+## Experimental Firecrawl inference
+
+Firecrawl is being tested as a constrained inference backend even though its
+Agent API is designed primarily for web data gathering. Keep the key only in
+the ignored local `.env`:
+
+```bash
+JACVERIFY_MOCK_LLM=0
+JACVERIFY_LLM_BACKEND=firecrawl
+FIRECRAWL_API_KEY=
+JACVERIFY_FIRECRAWL_MODEL=spark-1-mini
+JACVERIFY_FIRECRAWL_MAX_CREDITS=100
+```
+
+Each call submits a strict JSON schema and polls for completion. One demo run
+uses one ranking job plus up to three artifact jobs. The adapter never allows
+the response to select an RTL path or produce a verification PASS.
 
 ## Verify
 
@@ -100,24 +150,24 @@ jac test jacverify/store.jac -v
 
 JACVERIFY_MOCK_TOOLS=1 \
 JACVERIFY_MOCK_LLM=1 \
-.jac/venv/bin/python -m pytest tests/test_tool_adapter.py -q
+PYTHONPATH=. .venv/bin/python -m pytest tests/test_tool_adapter.py -q
 ```
 
 ## What is live vs mocked
 
 - **Always Jac-orchestrated:** seven walkers, graph nodes/edges, transition records.
-- **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise real Icarus compile/sim/reverify.
-- **LLM:** deterministic ranked hypotheses + reviewed-candidate artifact description when `JACVERIFY_MOCK_LLM=1`.
-- **Fixed RTL:** `demo/*/…_fixed.sv` files are **pre-reviewed candidate fixtures**, not LLM-authored patches. Re-verification PASS comes only from the simulator `ToolResult`.
+- **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise Icarus compiles the uploaded design with the prototype generated test.
+- **LLM:** deterministic outputs in mock mode; Firecrawl Agent is the current experimental live adapter, with typed Jac byLLM retained as an alternative.
+- **Fixed RTL:** `demo/fifo/fifo_fixed.sv` is a **pre-reviewed candidate fixture**, not an LLM-authored patch. Re-verification PASS comes only from the simulator `ToolResult`.
 
 ## Architecture
 
 ```text
-Dashboard / run_fifo_demo
+Dashboard / run_uploaded_inputs
   → create fresh Run
   → LoadInputsWalker … ReverifyAndRenderWalker
       → ToolResult adapters (mock or Icarus)
-      → typed LLM wrappers (mock)
+      → constrained LLM wrappers (mock, Firecrawl Agent, or Jac byLLM)
       → Requirement / Module / Test / Run / Failure / Hypothesis / Artifact graph
 ```
 
@@ -125,7 +175,7 @@ Important entrypoints:
 
 - `main.jac` — full-stack entry
 - `jacverify/store.jac` — graph model, seven walkers, endpoints
+- `jacverify/llm_calls.jac` — two constrained, typed byLLM declarations
 - `jacverify/tool_adapter.py` — shared `ToolResult` + mock/live adapters
-- `demo/fifo/` — FIFO wraparound case (buggy/fixed RTL, smoke + wrap TB, five requirements)
-- `demo/alu/` — ALU SUB-opcode case (same shape as FIFO)
-- `demo/shift_reg/` — shift-register direction case (same shape as FIFO)
+- `demo/fifo/` — buggy/fixed RTL, hardcoded prototype tests, five requirements
+- `Documents/JacVerify_LLM功能现状.md` — current LLM scope, setup, and remaining work

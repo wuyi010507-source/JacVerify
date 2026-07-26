@@ -4,9 +4,10 @@ sv import from .store {
     DemoRunResult,
     TransitionView,
     UploadPreview,
-    preview_upload,
+    preview_curated_inputs,
+    preview_uploaded_inputs,
     run_fifo_demo,
-    run_uploaded_design,
+    run_uploaded_inputs,
 }
 
 def:pub EvidenceBadge(evidence_kind: str) -> JsxElement {
@@ -40,25 +41,30 @@ def:pub Dashboard -> JsxElement {
     has demo_run: DemoRunResult | None = None,
         running: bool = False,
         error_message: str = "",
-        upload_filename: str = "",
-        upload_content: str = "",
+        design_filename: str = "",
+        design_content: str = "",
+        spec_filename: str = "",
+        spec_content: str = "",
         upload_preview: UploadPreview | None = None,
         reading_upload: bool = False,
         curated_session: bool = False;
 
     async def run_demo;
     async def use_curated_sample;
-    async def on_file_change(e: any);
-    def clear_upload(_e: MouseEvent);
+    async def on_design_file_change(e: any);
+    async def on_spec_file_change(e: any);
+    def clear_design(_e: MouseEvent);
+    def clear_spec(_e: MouseEvent);
 
     return <div className="app-shell">
         <header className="topbar">
             <div className="brand-lockup">
-                <div className="brand-mark">JV</div>
-                <div>
-                    <div className="brand-name">JacVerify</div>
-                    <div className="brand-subtitle">Evidence-driven verification loop</div>
-                </div>
+                <div
+                    className="brand-logo"
+                    role="img"
+                    aria-label="JacVerify"
+                ></div>
+                <div className="brand-subtitle">Evidence-driven verification loop</div>
             </div>
             <div className="topbar-actions">
                 <span className="live-dot"></span>
@@ -94,11 +100,10 @@ def:pub Dashboard -> JsxElement {
                 <div className="task-hero">
                     <div>
                         <div className="eyebrow">SEVEN-WALKER EVIDENCE LOOP</div>
-                        <h2>Run verification on an uploaded design</h2>
+                        <h2>Verify a design from its specification</h2>
                         <p>
-                            Upload RTL to start. Today's runtime executes curated demo cases so
-                            the red-to-green path stays reliable; more cases can be allow-listed
-                            without changing the walker pipeline.
+                            Upload RTL and its requirements. JacVerify generates a testbench,
+                            runs it, and records tool evidence and coverage.
                         </p>
                     </div>
                     <button
@@ -107,11 +112,18 @@ def:pub Dashboard -> JsxElement {
                         disabled={
                             running
                             or reading_upload
-                            or (not upload_content and not curated_session)
+                            or (
+                                (not design_content or not spec_content)
+                                and not curated_session
+                            )
                         }
                         title={
-                            "Upload a design or use a curated sample first"
-                            if (not upload_content and not curated_session and not running)
+                            "Upload both a design and specification first"
+                            if (
+                                (not design_content or not spec_content)
+                                and not curated_session
+                                and not running
+                            )
                             else ""
                         }
                     >
@@ -119,8 +131,11 @@ def:pub Dashboard -> JsxElement {
                             "Running walkers…"
                             if running
                             else (
-                                "Upload a design first"
-                                if (not upload_content and not curated_session)
+                                "Upload design + spec first"
+                                if (
+                                    (not design_content or not spec_content)
+                                    and not curated_session
+                                )
                                 else "Run verification loop"
                             )
                         }
@@ -128,33 +143,48 @@ def:pub Dashboard -> JsxElement {
                 </div>
 
                 <div className="upload-panel">
-                    <label className="upload-drop">
-                        <input
-                            className="upload-input"
-                            type="file"
-                            accept=".sv,.v,.vh,.vhd,.md,.txt"
-                            onChange={on_file_change}
-                            disabled={running or reading_upload}
-                        />
-                        <div className="upload-copy">
-                            <div className="eyebrow">DESIGN UPLOAD</div>
-                            <h3>
-                                {
-                                    "Reading file…"
-                                    if reading_upload
-                                    else (
-                                        upload_filename
-                                        if upload_filename
-                                        else "Drop or choose an RTL file"
-                                    )
-                                }
-                            </h3>
-                            <p>
-                                Product path is upload-driven. Hackathon execution is gated to
-                                curated cases; unknown designs are rejected explicitly.
-                            </p>
-                        </div>
-                    </label>
+                    <div className="upload-pair">
+                        <label className="upload-drop">
+                            <input
+                                className="upload-input"
+                                type="file"
+                                accept=".sv,.v,.vh"
+                                onChange={on_design_file_change}
+                                disabled={running or reading_upload}
+                            />
+                            <div className="upload-copy">
+                                <div className="eyebrow">1 · DESIGN RTL</div>
+                                <h3>
+                                    {
+                                        design_filename
+                                        if design_filename
+                                        else "Choose a design file"
+                                    }
+                                </h3>
+                                <p>The module under test. It is stored only in this run.</p>
+                            </div>
+                        </label>
+                        <label className="upload-drop">
+                            <input
+                                className="upload-input"
+                                type="file"
+                                accept=".md,.txt,.spec"
+                                onChange={on_spec_file_change}
+                                disabled={running or reading_upload}
+                            />
+                            <div className="upload-copy">
+                                <div className="eyebrow">2 · SPECIFICATION</div>
+                                <h3>
+                                    {
+                                        spec_filename
+                                        if spec_filename
+                                        else "Choose a specification file"
+                                    }
+                                </h3>
+                                <p>JacVerify uses this spec to generate the run's testbench.</p>
+                            </div>
+                        </label>
+                    </div>
                     <div className="upload-actions">
                         <button
                             className="secondary-action"
@@ -165,19 +195,26 @@ def:pub Dashboard -> JsxElement {
                         </button>
                         <button
                             className="secondary-action"
-                            onClick={clear_upload}
-                            disabled={running or reading_upload or not upload_filename}
+                            onClick={clear_design}
+                            disabled={running or reading_upload or not design_filename}
                         >
-                            Clear upload
+                            Clear design
+                        </button>
+                        <button
+                            className="secondary-action"
+                            onClick={clear_spec}
+                            disabled={running or reading_upload or not spec_filename}
+                        >
+                            Clear spec
                         </button>
                     </div>
                     {if upload_preview is not None {
                         <div className={"upload-status " + ("ok" if upload_preview.accepted else "blocked")}>
                             <strong>
                                 {
-                                    "CURATED CASE MATCHED · " + upload_preview.case_title
+                                    "INPUT PAIR READY · " + upload_preview.case_title
                                     if upload_preview.accepted
-                                    else "UPLOAD NOT IN CURATED SET"
+                                    else "INPUT PAIR INCOMPLETE"
                                 }
                             </strong>
                             <p>{upload_preview.message}</p>
@@ -189,13 +226,10 @@ def:pub Dashboard -> JsxElement {
                 {if demo_run is None {
                     <div className="empty-demo">
                         <div className="empty-icon">⬆</div>
-                        <h3>Upload a design to begin</h3>
+                        <h3>Upload a design and specification to begin</h3>
                         <p>
-                            For today's demo, upload <code>demo/fifo/fifo_buggy.sv</code>,
-                            <code>demo/alu/alu_buggy.sv</code>, or
-                            <code>demo/shift_reg/shift_reg_buggy.sv</code>, or click
-                            <strong>Use curated sample</strong>. Mock mode:
-                            JACVERIFY_MOCK_TOOLS=1 JACVERIFY_MOCK_LLM=1.
+                            The current prototype generates a hardcoded FIFO testbench. For the
+                            matching example, click <strong>Use curated sample</strong>.
                         </p>
                     </div>
                 } else {
@@ -215,11 +249,31 @@ def:pub Dashboard -> JsxElement {
                             </strong>
                         </div>
                         <div>
-                            <span>UPLOAD</span>
+                            <span>DESIGN</span>
                             <strong>
                                 {
                                     demo_run.uploaded_filename
                                     if demo_run.uploaded_filename
+                                    else "—"
+                                }
+                            </strong>
+                        </div>
+                        <div>
+                            <span>SPEC</span>
+                            <strong>
+                                {
+                                    demo_run.uploaded_spec_filename
+                                    if demo_run.uploaded_spec_filename
+                                    else "—"
+                                }
+                            </strong>
+                        </div>
+                        <div>
+                            <span>GENERATED TEST</span>
+                            <strong>
+                                {
+                                    demo_run.uploaded_test_filename
+                                    if demo_run.uploaded_test_filename
                                     else "—"
                                 }
                             </strong>
@@ -235,6 +289,12 @@ def:pub Dashboard -> JsxElement {
                         <div>
                             <span>LLM MODE</span>
                             <strong>{demo_run.llm_mode}</strong>
+                        </div>
+                        <div>
+                            <span>DEBUG ATTEMPT</span>
+                            <strong>
+                                {demo_run.debug_attempt}/{demo_run.max_debug_attempts}
+                            </strong>
                         </div>
                     </div>
 
@@ -252,11 +312,7 @@ def:pub Dashboard -> JsxElement {
                                 <StatusLabel status={demo_run.compile_status} />
                             </div>
                             <div>
-                                <span>Smoke</span>
-                                <StatusLabel status={demo_run.smoke_status} />
-                            </div>
-                            <div>
-                                <span>Regression</span>
+                                <span>Uploaded test</span>
                                 <StatusLabel status={demo_run.regression_status} />
                             </div>
                             <div>
@@ -285,7 +341,9 @@ def:pub Dashboard -> JsxElement {
                         }}
                         {if demo_run.top_hypothesis {
                             <div className="hypothesis-box">
-                                <div className="eyebrow">TOP HYPOTHESIS</div>
+                                <div className="eyebrow">
+                                    SELECTED HYPOTHESIS · RANK {demo_run.selected_hypothesis_rank}
+                                </div>
                                 <p>{demo_run.top_hypothesis}</p>
                                 <small>confidence={str(demo_run.top_confidence)[:4]} · model inference, not proof</small>
                             </div>
@@ -304,8 +362,77 @@ def:pub Dashboard -> JsxElement {
                             </div>
                         }}
                         {if demo_run.stop_reason {
-                            <div className="error-banner">{demo_run.stop_reason}</div>
+                            <div className="error-banner">
+                                {
+                                    "USER REVIEW REQUIRED · " + demo_run.stop_reason
+                                    if demo_run.needs_user_review
+                                    else demo_run.stop_reason
+                                }
+                            </div>
                         }}
+                    </div>
+
+                    <div className="coverage-panel">
+                        <div className="coverage-heading">
+                            <div>
+                                <div className="eyebrow">LATEST VALIDATION COVERAGE</div>
+                                <h3>Coverage reported by the generated test flow</h3>
+                            </div>
+                            <span className="coverage-source">
+                                {
+                                    demo_run.coverage_source
+                                    if demo_run.coverage_available
+                                    else "not reported · N/A"
+                                }
+                            </span>
+                        </div>
+                        <div className="coverage-grid">
+                            <div className="coverage-card">
+                                <div>
+                                    <span>CODE COVERAGE</span>
+                                    <strong>
+                                        {
+                                            str(demo_run.code_coverage)[:5] + "%"
+                                            if demo_run.coverage_available
+                                            else "N/A"
+                                        }
+                                    </strong>
+                                </div>
+                                <progress
+                                    max="100"
+                                    value={
+                                        demo_run.code_coverage
+                                        if demo_run.coverage_available
+                                        else 0
+                                    }
+                                ></progress>
+                            </div>
+                            <div className="coverage-card functional">
+                                <div>
+                                    <span>FUNCTIONAL COVERAGE</span>
+                                    <strong>
+                                        {
+                                            str(demo_run.functional_coverage)[:5] + "%"
+                                            if demo_run.coverage_available
+                                            else "N/A"
+                                        }
+                                    </strong>
+                                </div>
+                                <progress
+                                    max="100"
+                                    value={
+                                        demo_run.functional_coverage
+                                        if demo_run.coverage_available
+                                        else 0
+                                    }
+                                ></progress>
+                            </div>
+                        </div>
+                        <small>
+                            Optional protocol: print
+                            <code>JACVERIFY_COVERAGE code=82.5 functional=75.0</code>
+                            from the testbench. Missing values remain N/A.
+                        </small>
                     </div>
 
                     <div className="tool-proof">
@@ -323,11 +450,11 @@ def:pub Dashboard -> JsxElement {
                         </div>
                         <div className="terminal-grid">
                             <div className="terminal">
-                                <div className="terminal-label failure-output">BUGGY RTL · VERIFICATION FAILED</div>
+                                <div className="terminal-label failure-output">UPLOADED TEST · INITIAL RUN</div>
                                 <pre>{demo_run.regression_output}</pre>
                             </div>
                             <div className="terminal">
-                                <div className="terminal-label pass-output">REVIEWED FIXTURE · RE-VERIFICATION</div>
+                                <div className="terminal-label pass-output">OPTIONAL CANDIDATE · RE-VERIFICATION</div>
                                 <pre>{demo_run.reverify_output}</pre>
                             </div>
                         </div>

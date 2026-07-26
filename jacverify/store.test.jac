@@ -130,13 +130,23 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert first_run.llm_mode == "mock";
     assert first_run.requirement_count == 5;
     assert first_run.compile_status == "PASSED";
-    assert first_run.smoke_status == "PASSED";
+    assert first_run.smoke_status == "NOT_RUN";
     assert first_run.regression_status == "VERIFICATION_FAILED";
     assert first_run.reverify_status == "PASSED";
     assert first_run.failure_kind == "WRAP_MISMATCH";
     assert first_run.failure_expected == "55";
     assert first_run.failure_observed == "33";
     assert "Write pointer wraps to 1" in first_run.top_hypothesis;
+    assert first_run.debug_attempt == 1;
+    assert first_run.max_debug_attempts == 3;
+    assert first_run.selected_hypothesis_rank == 1;
+    assert not first_run.needs_user_review;
+    assert first_run.uploaded_spec_filename == "fifo_spec.md";
+    assert first_run.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert first_run.coverage_available;
+    assert first_run.code_coverage == 91.0;
+    assert first_run.functional_coverage == 100.0;
+    assert first_run.coverage_source == "mock:testbench_marker";
     assert first_run.candidate_applied;
     assert first_run.tool_evidence_available;
     assert "WRAP_MISMATCH" in first_run.regression_output;
@@ -166,7 +176,12 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     run = runs[0];
     assert len([run ->:OwnsRequirement:->]) == 5;
     assert len([run ->:OwnsModule:->]) == 1;
-    assert len([run ->:Executes:->]) == 2;
+    executed_tests: list[Test] = [run ->:Executes:->];
+    assert len(executed_tests) == 1;
+    assert executed_tests[0].name == "tb_wrap";
+    assert executed_tests[0].coverage_available;
+    assert executed_tests[0].code_coverage == 72.5;
+    assert executed_tests[0].functional_coverage == 66.7;
     assert len([run ->:FailedWith:->]) == 1;
     failure = [run ->:FailedWith:->][0];
     hyps = [failure ->:Motivates:->];
@@ -176,6 +191,88 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert len([arts[0] ->:ReverifiedBy:->]) == 1;
 }
 
+test "debug loop rejects two hypotheses then succeeds on attempt three" {
+    os.environ["JACVERIFY_REVERIFY_SEQUENCE"] = (
+        "VERIFICATION_FAILED,VERIFICATION_FAILED,PASSED"
+    );
+    result = run_fifo_demo();
+    os.environ.pop("JACVERIFY_REVERIFY_SEQUENCE", None);
+
+    assert result.status == "complete";
+    assert result.current_state == "DONE";
+    assert result.debug_attempt == 3;
+    assert result.selected_hypothesis_rank == 3;
+    assert not result.needs_user_review;
+    assert result.reverify_status == "PASSED";
+
+    runs: list[Run] = [root -->[?:Run, run_id == result.job_id]];
+    assert len(runs) == 1;
+    failure = [runs[0] ->:FailedWith:->][0];
+    hypotheses: list[Hypothesis] = sorted(
+        [failure ->:Motivates:->],
+        key=lambda (item: Hypothesis) {
+            item.rank;
+        }
+    );
+    assert len(hypotheses) == 3;
+    assert hypotheses[0].status == "rejected";
+    assert hypotheses[0].attempt_number == 1;
+    assert hypotheses[1].status == "rejected";
+    assert hypotheses[1].attempt_number == 2;
+    assert hypotheses[2].status == "supported";
+    assert hypotheses[2].attempt_number == 3;
+
+    artifacts: list[Artifact] = [];
+    for hypothesis in hypotheses {
+        for artifact in [hypothesis ->:Produces:->] {
+            artifacts.append(artifact);
+        }
+    }
+    assert len(artifacts) == 3;
+    assert len([artifacts[0] ->:ReverifiedBy:->]) == 1;
+    assert len([artifacts[1] ->:ReverifiedBy:->]) == 1;
+    assert len([artifacts[2] ->:ReverifiedBy:->]) == 1;
+
+    events = [transition.event for transition in result.transitions];
+    assert events.count("hypothesis_rejected") == 2;
+    assert events.count("next_hypothesis_selected") == 2;
+    assert "reverification_passed" in events;
+}
+
+test "debug loop stops for user review after three failed attempts" {
+    os.environ["JACVERIFY_REVERIFY_SEQUENCE"] = (
+        "VERIFICATION_FAILED,VERIFICATION_FAILED,VERIFICATION_FAILED"
+    );
+    result = run_fifo_demo();
+    os.environ.pop("JACVERIFY_REVERIFY_SEQUENCE", None);
+
+    assert result.status == "blocked";
+    assert result.current_state == "NEEDS_USER_REVIEW";
+    assert result.debug_attempt == 3;
+    assert result.max_debug_attempts == 3;
+    assert result.needs_user_review;
+    assert result.reverify_status == "VERIFICATION_FAILED";
+    assert "user intervention" in result.stop_reason;
+    events = [transition.event for transition in result.transitions];
+    assert events.count("hypothesis_rejected") == 2;
+    assert events[-1] == "debug_attempt_limit_reached";
+}
+
+test "unexpected reverify tool error stops without automatic retry" {
+    os.environ["JACVERIFY_REVERIFY_SEQUENCE"] = "TOOL_ERROR";
+    result = run_fifo_demo();
+    os.environ.pop("JACVERIFY_REVERIFY_SEQUENCE", None);
+
+    assert result.status == "blocked";
+    assert result.current_state == "NEEDS_USER_REVIEW";
+    assert result.debug_attempt == 1;
+    assert result.needs_user_review;
+    assert result.reverify_status == "TOOL_ERROR";
+    events = [transition.event for transition in result.transitions];
+    assert events[-1] == "unexpected_reverify_requires_review";
+    assert "hypothesis_rejected" not in events;
+}
+
 test "dashboard endpoint still returns project recommendations" {
     dashboard = get_dashboard();
     assert dashboard.failure_events == 18;
@@ -183,14 +280,32 @@ test "dashboard endpoint still returns project recommendations" {
     assert len(dashboard.recommendations) == 3;
 }
 
-test "upload path accepts curated FIFO content and rejects unknown RTL" {
+test "upload path accepts design and spec and generates a test" {
     workspace = os.getcwd();
     buggy = read_text_file(
         os.path.join(workspace, "demo", "fifo", "fifo_buggy.sv")
     );
-    preview = preview_upload("uploaded_fifo.sv", buggy);
-    accepted = run_uploaded_design("uploaded_fifo.sv", buggy);
-    rejected = run_uploaded_design("random.sv", "module nope; endmodule\n");
+    spec = read_text_file(
+        os.path.join(workspace, "demo", "fifo", "fifo_spec.md")
+    );
+    preview = preview_uploaded_inputs(
+        "uploaded_fifo.sv",
+        buggy,
+        "uploaded_spec.md",
+        spec
+    );
+    accepted = run_uploaded_inputs(
+        "uploaded_fifo.sv",
+        buggy,
+        "uploaded_spec.md",
+        spec
+    );
+    rejected = run_uploaded_inputs(
+        "random.sv",
+        "module nope; endmodule\n",
+        "empty_spec.md",
+        ""
+    );
 
     assert preview.accepted;
     assert preview.case_id == "fifo";
@@ -198,7 +313,29 @@ test "upload path accepts curated FIFO content and rejects unknown RTL" {
     assert accepted.upload_accepted;
     assert accepted.case_id == "fifo";
     assert accepted.uploaded_filename == "uploaded_fifo.sv";
+    assert accepted.uploaded_spec_filename == "uploaded_spec.md";
+    assert accepted.uploaded_test_filename == "generated_tb_wrap.sv";
     assert rejected.status == "blocked";
     assert not rejected.upload_accepted;
-    assert "curated" in rejected.stop_reason or "Curated" in rejected.stop_reason;
+    assert "specification" in rejected.stop_reason;
+}
+
+test "unrecognized design and spec never receives the FIFO fix" {
+    result = run_uploaded_inputs(
+        "adder.sv",
+        "module adder; endmodule\n",
+        "adder_spec.md",
+        "# Adder\n\nThe output must equal the sum.\n"
+    );
+
+    assert result.upload_accepted;
+    assert result.case_id == "uploaded";
+    assert result.uploaded_filename == "adder.sv";
+    assert result.uploaded_spec_filename == "adder_spec.md";
+    assert result.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert result.current_state == "NEEDS_USER_REVIEW";
+    assert result.needs_user_review;
+    assert result.debug_attempt == 0;
+    assert not result.candidate_applied;
+    assert "no reviewed candidate fixture" in result.stop_reason;
 }

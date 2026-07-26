@@ -1,8 +1,10 @@
 """Client handler implementations for the JacVerify dashboard."""
 
 impl Dashboard.run_demo {
-    if not curated_session and not upload_content {
-        error_message = "Upload a design file before running the verification loop.";
+    if not curated_session and (not design_content or not spec_content) {
+        error_message = (
+            "Upload both a design file and a specification before running verification."
+        );
         return;
     }
     running = True;
@@ -11,7 +13,12 @@ impl Dashboard.run_demo {
         result: DemoRunResult = (
             await run_fifo_demo()
             if curated_session
-            else await run_uploaded_design(upload_filename, upload_content)
+            else await run_uploaded_inputs(
+                design_filename,
+                design_content,
+                spec_filename,
+                spec_content
+            )
         );
         demo_run = result;
         if result.status == "blocked" and not result.upload_accepted {
@@ -30,28 +37,21 @@ impl Dashboard.use_curated_sample {
     curated_session = True;
     try {
         result: DemoRunResult = await run_fifo_demo();
+        preview: UploadPreview = await preview_curated_inputs();
         demo_run = result;
-        selected_name = (
+        design_filename = (
             result.uploaded_filename
             if result.uploaded_filename
             else "fifo_buggy.sv"
         );
-        upload_filename = selected_name;
-        upload_content = "";
-        upload_preview = UploadPreview(
-            accepted=True,
-            case_id=result.case_id,
-            case_title=result.case_title,
-            message=(
-                "Loaded a curated sample through the upload product path. "
-                "You can also choose fifo/alu/shift_reg buggy RTL from disk."
-            ),
-            filename=selected_name,
-            curated_hint=(
-                "Curated today: demo/fifo/fifo_buggy.sv, "
-                "demo/alu/alu_buggy.sv, demo/shift_reg/shift_reg_buggy.sv"
-            )
+        spec_filename = (
+            result.uploaded_spec_filename
+            if result.uploaded_spec_filename
+            else "fifo_spec.md"
         );
+        design_content = "";
+        spec_content = "";
+        upload_preview = preview;
         if result.status == "blocked" {
             error_message = result.stop_reason;
         }
@@ -61,7 +61,7 @@ impl Dashboard.use_curated_sample {
     running = False;
 }
 
-impl Dashboard.on_file_change(e: any) {
+impl Dashboard.on_design_file_change(e: any) {
     reading_upload = True;
     error_message = "";
     demo_run = None;
@@ -73,30 +73,82 @@ impl Dashboard.on_file_change(e: any) {
             return;
         }
         file = file_list[0];
-        # Locals required: Jac/React has-fields update asynchronously.
         selected_name: str = file.name;
         selected_content: str = await file.text();
-        preview: UploadPreview = await preview_upload(
-            selected_name,
-            selected_content
-        );
-        upload_filename = selected_name;
-        upload_content = selected_content;
-        upload_preview = preview;
-        if preview is not None and not preview.accepted {
-            error_message = preview.message;
+        design_filename = selected_name;
+        design_content = selected_content;
+        if spec_content {
+            preview: UploadPreview = await preview_uploaded_inputs(
+                selected_name,
+                selected_content,
+                spec_filename,
+                spec_content
+            );
+            upload_preview = preview;
+            if not preview.accepted {
+                error_message = preview.message;
+            }
+        } else {
+            upload_preview = None;
         }
     } except Exception as err {
-        error_message = "Could not read the uploaded file: " + str(err);
+        error_message = "Could not read the design file: " + str(err);
         upload_preview = None;
-        upload_content = "";
+        design_content = "";
     }
     reading_upload = False;
 }
 
-impl Dashboard.clear_upload(_e: MouseEvent) {
-    upload_filename = "";
-    upload_content = "";
+impl Dashboard.on_spec_file_change(e: any) {
+    reading_upload = True;
+    error_message = "";
+    demo_run = None;
+    curated_session = False;
+    try {
+        file_list = e.target.files;
+        if file_list is None or file_list.length == 0 {
+            reading_upload = False;
+            return;
+        }
+        file = file_list[0];
+        selected_name: str = file.name;
+        selected_content: str = await file.text();
+        spec_filename = selected_name;
+        spec_content = selected_content;
+        if design_content {
+            preview: UploadPreview = await preview_uploaded_inputs(
+                design_filename,
+                design_content,
+                selected_name,
+                selected_content
+            );
+            upload_preview = preview;
+            if not preview.accepted {
+                error_message = preview.message;
+            }
+        } else {
+            upload_preview = None;
+        }
+    } except Exception as err {
+        error_message = "Could not read the specification file: " + str(err);
+        upload_preview = None;
+        spec_content = "";
+    }
+    reading_upload = False;
+}
+
+impl Dashboard.clear_design(_e: MouseEvent) {
+    design_filename = "";
+    design_content = "";
+    upload_preview = None;
+    demo_run = None;
+    error_message = "";
+    curated_session = False;
+}
+
+impl Dashboard.clear_spec(_e: MouseEvent) {
+    spec_filename = "";
+    spec_content = "";
     upload_preview = None;
     demo_run = None;
     error_message = "";
