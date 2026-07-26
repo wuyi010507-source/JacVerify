@@ -78,13 +78,14 @@ Upload path (product UX):
 1. Choose an RTL module in **Design RTL**.
 2. Choose its requirements document in **Specification**.
 3. Click **Run verification loop**, or use the curated FIFO design/spec pair.
+   Matching curated pairs also work for `demo/alu` and `demo/shift_reg`.
 4. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
 
 The design and spec are saved under that run's isolated
-`runs/<run-id>/inputs/` directory. The current prototype generates
-`generated_tb_wrap.sv` from the checked-in FIFO wraparound test fixture; this
-hardcoded step will later be replaced by spec-driven generation. Automatic
-candidate application remains restricted to reviewed fixtures.
+`runs/<run-id>/inputs/` directory. Matched curated cases inject their directed
+testbench; other uploads use the prototype FIFO wrap TB
+(`generated_tb_wrap.sv`). Automatic candidate application remains restricted to
+reviewed fixtures.
 
 Coverage is optional and generated-test-owned. A testbench can publish both
 metrics with:
@@ -113,7 +114,7 @@ inference. Use `--live-tools` only after that succeeds.
 Requires Icarus Verilog (verified with 12.0):
 
 ```bash
-brew install icarus-verilog
+brew install icarus-verilog   # once, locally
 
 JACVERIFY_MOCK_TOOLS=0 \
 JACVERIFY_MOCK_LLM=1 \
@@ -158,7 +159,7 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/test_tool_adapter.py -q
 - **Always Jac-orchestrated:** seven walkers, graph nodes/edges, transition records.
 - **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise Icarus compiles the uploaded design with the prototype generated test.
 - **LLM:** deterministic outputs in mock mode; Firecrawl Agent is the current experimental live adapter, with typed Jac byLLM retained as an alternative.
-- **Fixed RTL:** `demo/fifo/fifo_fixed.sv` is a **pre-reviewed candidate fixture**, not an LLM-authored patch. Re-verification PASS comes only from the simulator `ToolResult`.
+- **Fixed RTL:** `demo/*/…_fixed.sv` files are **pre-reviewed candidate fixtures**, not LLM-authored patches. Re-verification PASS comes only from the simulator `ToolResult`.
 
 ## Architecture
 
@@ -177,5 +178,7 @@ Important entrypoints:
 - `jacverify/store.jac` — graph model, seven walkers, endpoints
 - `jacverify/llm_calls.jac` — two constrained, typed byLLM declarations
 - `jacverify/tool_adapter.py` — shared `ToolResult` + mock/live adapters
-- `demo/fifo/` — buggy/fixed RTL, hardcoded prototype tests, five requirements
+- `demo/fifo/` — FIFO wraparound curated case
+- `demo/alu/` — ALU SUB-opcode curated case
+- `demo/shift_reg/` — shift-register direction curated case
 - `Documents/JacVerify_LLM功能现状.md` — current LLM scope, setup, and remaining work

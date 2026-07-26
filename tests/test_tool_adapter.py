@@ -23,6 +23,7 @@ from jacverify.tool_adapter import (
     run_reverify,
     run_smoke,
     run_wrap_regression,
+    set_active_case,
 )
 
 
@@ -32,6 +33,7 @@ def _mock_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JACVERIFY_MOCK_LLM", "1")
     monkeypatch.delenv("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", raising=False)
     monkeypatch.delenv("JACVERIFY_FORCE_REVERIFY_FAIL", raising=False)
+    set_active_case("fifo")
 
 
 def test_parse_wrap_mismatch_into_failure_evidence() -> None:
@@ -252,3 +254,73 @@ def test_coverage_marker_is_parsed_from_test_output(tmp_path: Path) -> None:
     assert coverage.code_coverage == 72.5
     assert coverage.functional_coverage == 66.7
     assert coverage.source == "mock:testbench_marker"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fail_kind", "expected", "observed", "claim_needle", "fixed_name"),
+    [
+        ("alu", "ALU_MISMATCH", "05", "0b", "sub", "alu_fixed.sv"),
+        (
+            "shift_reg",
+            "SHIFT_MISMATCH",
+            "40",
+            "00",
+            "shift",
+            "shift_reg_fixed.sv",
+        ),
+    ],
+)
+def test_mock_pipeline_for_sibling_cases(
+    case_id: str,
+    fail_kind: str,
+    expected: str,
+    observed: str,
+    claim_needle: str,
+    fixed_name: str,
+    tmp_path: Path,
+) -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    set_active_case(case_id)
+
+    spec = load_spec(str(workspace))
+    regression = run_wrap_regression(str(workspace), str(tmp_path / case_id))
+    evidence = parse_failure_evidence(regression)
+    assert evidence is not None
+    hypotheses = rank_hypotheses(evidence)
+    artifact = generate_artifact(hypotheses[0], case_id)
+    reverify = run_reverify(str(workspace), str(tmp_path / case_id))
+    curated = load_curated_case_upload(str(workspace), case_id)
+    design = (workspace / "demo" / case_id / f"{case_id}_buggy.sv").read_text(
+        encoding="utf-8"
+    )
+    case_spec = (workspace / "demo" / case_id / f"{case_id}_spec.md").read_text(
+        encoding="utf-8"
+    )
+    matched = identify_uploaded_inputs(
+        str(workspace),
+        f"{case_id}_buggy.sv",
+        design,
+        f"{case_id}_spec.md",
+        case_spec,
+    )
+    paths = materialize_uploaded_inputs(
+        str(workspace),
+        str(tmp_path / f"{case_id}-inputs"),
+        f"{case_id}_buggy.sv",
+        design,
+        f"{case_id}_spec.md",
+        case_spec,
+    )
+
+    assert spec.requirement_count == 5
+    assert spec.module_name == case_id
+    assert regression.status == STATUS_VERIFICATION_FAILED
+    assert evidence.kind == fail_kind
+    assert evidence.expected == expected
+    assert evidence.observed == observed
+    assert claim_needle in hypotheses[0].claim.lower()
+    assert fixed_name in artifact.candidate_path
+    assert reverify.status == STATUS_PASSED
+    assert curated.accepted
+    assert matched.accepted and matched.case_id == case_id
+    assert Path(paths.test_path).name == "generated_tb_directed.sv"
