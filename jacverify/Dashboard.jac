@@ -43,8 +43,8 @@ def:pub Dashboard -> JsxElement {
         error_message: str = "",
         design_filename: str = "",
         design_content: str = "",
-        test_filename: str = "",
-        test_content: str = "",
+        spec_filename: str = "",
+        spec_content: str = "",
         upload_preview: UploadPreview | None = None,
         reading_upload: bool = False,
         curated_session: bool = False;
@@ -52,9 +52,9 @@ def:pub Dashboard -> JsxElement {
     async def run_demo;
     async def use_curated_sample;
     async def on_design_file_change(e: any);
-    async def on_test_file_change(e: any);
+    async def on_spec_file_change(e: any);
     def clear_design(_e: MouseEvent);
-    def clear_test(_e: MouseEvent);
+    def clear_spec(_e: MouseEvent);
 
     return <div className="app-shell">
         <header className="topbar">
@@ -99,10 +99,10 @@ def:pub Dashboard -> JsxElement {
                 <div className="task-hero">
                     <div>
                         <div className="eyebrow">SEVEN-WALKER EVIDENCE LOOP</div>
-                        <h2>Verify any design with its own testbench</h2>
+                        <h2>Verify a design from its specification</h2>
                         <p>
-                            Design and test are independent inputs. JacVerify compiles and runs
-                            exactly the pair you provide, then records tool evidence and coverage.
+                            Upload RTL and its requirements. JacVerify generates a testbench,
+                            runs it, and records tool evidence and coverage.
                         </p>
                     </div>
                     <button
@@ -112,14 +112,14 @@ def:pub Dashboard -> JsxElement {
                             running
                             or reading_upload
                             or (
-                                (not design_content or not test_content)
+                                (not design_content or not spec_content)
                                 and not curated_session
                             )
                         }
                         title={
-                            "Upload both a design and testbench first"
+                            "Upload both a design and specification first"
                             if (
-                                (not design_content or not test_content)
+                                (not design_content or not spec_content)
                                 and not curated_session
                                 and not running
                             )
@@ -130,9 +130,9 @@ def:pub Dashboard -> JsxElement {
                             "Running walkers…"
                             if running
                             else (
-                                "Upload design + test first"
+                                "Upload design + spec first"
                                 if (
-                                    (not design_content or not test_content)
+                                    (not design_content or not spec_content)
                                     and not curated_session
                                 )
                                 else "Run verification loop"
@@ -167,20 +167,20 @@ def:pub Dashboard -> JsxElement {
                             <input
                                 className="upload-input"
                                 type="file"
-                                accept=".sv,.v,.vh"
-                                onChange={on_test_file_change}
+                                accept=".md,.txt,.spec"
+                                onChange={on_spec_file_change}
                                 disabled={running or reading_upload}
                             />
                             <div className="upload-copy">
-                                <div className="eyebrow">2 · TESTBENCH</div>
+                                <div className="eyebrow">2 · SPECIFICATION</div>
                                 <h3>
                                     {
-                                        test_filename
-                                        if test_filename
-                                        else "Choose a testbench file"
+                                        spec_filename
+                                        if spec_filename
+                                        else "Choose a specification file"
                                     }
                                 </h3>
-                                <p>This uploaded test defines the executable pass/fail contract.</p>
+                                <p>JacVerify uses this spec to generate the run's testbench.</p>
                             </div>
                         </label>
                     </div>
@@ -201,10 +201,10 @@ def:pub Dashboard -> JsxElement {
                         </button>
                         <button
                             className="secondary-action"
-                            onClick={clear_test}
-                            disabled={running or reading_upload or not test_filename}
+                            onClick={clear_spec}
+                            disabled={running or reading_upload or not spec_filename}
                         >
-                            Clear test
+                            Clear spec
                         </button>
                     </div>
                     {if upload_preview is not None {
@@ -225,10 +225,10 @@ def:pub Dashboard -> JsxElement {
                 {if demo_run is None {
                     <div className="empty-demo">
                         <div className="empty-icon">⬆</div>
-                        <h3>Upload a design and testbench to begin</h3>
+                        <h3>Upload a design and specification to begin</h3>
                         <p>
-                            Any SystemVerilog pair is accepted. For a known failing example with
-                            automatic remediation, click <strong>Use curated sample</strong>.
+                            The current prototype generates a hardcoded FIFO testbench. For the
+                            matching example, click <strong>Use curated sample</strong>.
                         </p>
                     </div>
                 } else {
@@ -258,7 +258,17 @@ def:pub Dashboard -> JsxElement {
                             </strong>
                         </div>
                         <div>
-                            <span>TEST</span>
+                            <span>SPEC</span>
+                            <strong>
+                                {
+                                    demo_run.uploaded_spec_filename
+                                    if demo_run.uploaded_spec_filename
+                                    else "—"
+                                }
+                            </strong>
+                        </div>
+                        <div>
+                            <span>GENERATED TEST</span>
                             <strong>
                                 {
                                     demo_run.uploaded_test_filename
@@ -365,7 +375,7 @@ def:pub Dashboard -> JsxElement {
                         <div className="coverage-heading">
                             <div>
                                 <div className="eyebrow">LATEST VALIDATION COVERAGE</div>
-                                <h3>Coverage reported by the uploaded test flow</h3>
+                                <h3>Coverage reported by the generated test flow</h3>
                             </div>
                             <span className="coverage-source">
                                 {

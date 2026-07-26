@@ -82,6 +82,7 @@ class CoverageResult:
 @dataclass(frozen=True)
 class UploadedInputPaths:
     design_path: str
+    spec_path: str
     test_path: str
     design_module: str
     test_module: str
@@ -165,8 +166,25 @@ def _fifo_paths(workspace_root: str) -> dict[str, Path]:
 
 def load_spec(workspace_root: str) -> SpecLoadResult:
     paths = _fifo_paths(workspace_root)
+    return load_uploaded_spec(
+        str(paths["spec_path"]),
+        str(paths["buggy_rtl"]),
+        "fifo",
+    )
+
+
+def load_uploaded_spec(
+    spec_path: str,
+    module_path: str,
+    module_name: str,
+) -> SpecLoadResult:
+    """Load requirements from an uploaded spec, with a plain-text fallback."""
+    path = Path(spec_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Uploaded specification is missing: {path}")
+    spec_text = path.read_text(encoding="utf-8")
     requirements: list[RequirementItem] = []
-    for line in paths["spec_path"].read_text(encoding="utf-8").splitlines():
+    for line in spec_text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("- REQ-"):
             continue
@@ -178,14 +196,26 @@ def load_spec(workspace_root: str) -> SpecLoadResult:
                 text=text.strip() or body,
             )
         )
-    if len(requirements) != 5:
-        raise ValueError("FIFO demo specification must contain exactly five requirements")
+    if not requirements:
+        fallback = " ".join(
+            line.strip().lstrip("#").strip()
+            for line in spec_text.splitlines()
+            if line.strip()
+        )
+        if not fallback:
+            raise ValueError("Uploaded specification is empty")
+        requirements.append(
+            RequirementItem(
+                req_id="REQ-SPEC",
+                text=fallback[:1000],
+            )
+        )
     return SpecLoadResult(
         requirement_count=len(requirements),
-        spec_path=str(paths["spec_path"]),
+        spec_path=str(path),
         requirements=requirements,
-        module_path=str(paths["buggy_rtl"]),
-        module_name="fifo",
+        module_path=module_path,
+        module_name=module_name,
         mode=tools_mode(),
     )
 
@@ -458,30 +488,36 @@ def _module_name(source: str, label: str) -> str:
 
 
 def materialize_uploaded_inputs(
+    workspace_root: str,
     output_dir: str,
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str,
+    spec_filename: str,
+    spec_content: str,
 ) -> UploadedInputPaths:
-    """Write a user-supplied design/test pair into an isolated run directory."""
+    """Write design/spec inputs and inject the prototype generated testbench."""
     inputs_dir = _ensure_output_dir(output_dir) / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     design_name = _safe_upload_name(design_filename, "design.sv")
-    test_name = _safe_upload_name(test_filename, "testbench.sv")
-    if design_name == test_name:
-        test_name = f"test_{test_name}"
+    spec_name = _safe_upload_name(spec_filename, "spec.md")
+    test_name = "generated_tb_wrap.sv"
     design_path = inputs_dir / design_name
+    spec_path = inputs_dir / spec_name
     test_path = inputs_dir / test_name
     normalized_design = normalize_source(design_content)
-    normalized_test = normalize_source(test_content)
+    normalized_spec = normalize_source(spec_content)
+    normalized_test = normalize_source(
+        _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
+    )
     design_path.write_text(normalized_design, encoding="utf-8")
+    spec_path.write_text(normalized_spec, encoding="utf-8")
     test_path.write_text(normalized_test, encoding="utf-8")
     return UploadedInputPaths(
         design_path=str(design_path),
+        spec_path=str(spec_path),
         test_path=str(test_path),
         design_module=_module_name(normalized_design, "Uploaded design"),
-        test_module=_module_name(normalized_test, "Uploaded testbench"),
+        test_module=_module_name(normalized_test, "Generated testbench"),
     )
 
 
@@ -708,7 +744,7 @@ def run_uploaded_test(
     design_path: str,
     test_path: str,
 ) -> ToolResult:
-    """Compile and execute exactly the uploaded design/test pair."""
+    """Compile the uploaded design with the test generated for this run."""
     if tools_mode() == "mock":
         force = os.environ.get("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", "")
         return _mock_regression(reproduce_bug=force != "1")
@@ -1307,6 +1343,7 @@ class CuratedCase:
     title: str
     description: str
     buggy_relpath: str
+    spec_relpath: str
     test_relpath: str
     accepted_filenames: tuple[str, ...]
 
@@ -1318,7 +1355,8 @@ class UploadMatch:
     case_title: str
     message: str
     filename: str
-    test_filename: str = ""
+    spec_filename: str = ""
+    generated_test_filename: str = "generated_tb_wrap.sv"
 
 
 CURATED_CASES: tuple[CuratedCase, ...] = (
@@ -1330,6 +1368,7 @@ CURATED_CASES: tuple[CuratedCase, ...] = (
             "Hackathon demo uses a reviewed fix fixture for re-verification."
         ),
         buggy_relpath="demo/fifo/fifo_buggy.sv",
+        spec_relpath="demo/fifo/fifo_spec.md",
         test_relpath="demo/fifo/tb_wrap.sv",
         accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
     ),
@@ -1343,6 +1382,7 @@ def list_curated_cases() -> list[dict[str, str]]:
             "title": case.title,
             "description": case.description,
             "buggy_relpath": case.buggy_relpath,
+            "spec_relpath": case.spec_relpath,
             "test_relpath": case.test_relpath,
             "accepted_filenames": ", ".join(case.accepted_filenames),
         }
@@ -1413,12 +1453,12 @@ def identify_uploaded_inputs(
     workspace_root: str,
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str,
+    spec_filename: str,
+    spec_content: str,
 ) -> UploadMatch:
-    """Validate a design/test pair and recognize optional curated fixtures."""
+    """Validate design/spec inputs and recognize optional curated fixtures."""
     design_basename = _safe_upload_name(design_filename, "design.sv")
-    test_basename = _safe_upload_name(test_filename, "testbench.sv")
+    spec_basename = _safe_upload_name(spec_filename, "spec.md")
     if not design_content or not design_content.strip():
         return UploadMatch(
             accepted=False,
@@ -1426,20 +1466,19 @@ def identify_uploaded_inputs(
             case_title="",
             message="Upload an RTL design file to continue.",
             filename=design_basename,
-            test_filename=test_basename,
+            spec_filename=spec_basename,
         )
-    if not test_content or not test_content.strip():
+    if not spec_content or not spec_content.strip():
         return UploadMatch(
             accepted=False,
             case_id="",
             case_title="",
-            message="Upload a testbench file to continue.",
+            message="Upload a specification file to continue.",
             filename=design_basename,
-            test_filename=test_basename,
+            spec_filename=spec_basename,
         )
     try:
         _module_name(design_content, "Uploaded design")
-        _module_name(test_content, "Uploaded testbench")
     except ValueError as exc:
         return UploadMatch(
             accepted=False,
@@ -1447,44 +1486,44 @@ def identify_uploaded_inputs(
             case_title="",
             message=str(exc),
             filename=design_basename,
-            test_filename=test_basename,
+            spec_filename=spec_basename,
         )
 
     design_fp = source_fingerprint(design_content)
-    test_fp = source_fingerprint(test_content)
+    spec_fp = source_fingerprint(spec_content)
     for case in CURATED_CASES:
         root = Path(workspace_root).resolve()
         design_path = root / case.buggy_relpath
-        test_path = root / case.test_relpath
-        if not design_path.is_file() or not test_path.is_file():
+        spec_path = root / case.spec_relpath
+        if not design_path.is_file() or not spec_path.is_file():
             continue
         if (
             design_fp == source_fingerprint(design_path.read_text(encoding="utf-8"))
-            and test_fp == source_fingerprint(test_path.read_text(encoding="utf-8"))
+            and spec_fp == source_fingerprint(spec_path.read_text(encoding="utf-8"))
         ):
             return UploadMatch(
                 accepted=True,
                 case_id=case.case_id,
                 case_title=case.title,
                 message=(
-                    f"Ready: `{design_basename}` will be verified by "
-                    f"`{test_basename}`. This pair also matches the reviewed "
-                    "FIFO demo fixture."
+                    f"Ready: `{design_basename}` and `{spec_basename}` match "
+                    "the reviewed FIFO fixture. JacVerify will generate the "
+                    "prototype wraparound testbench."
                 ),
                 filename=design_basename,
-                test_filename=test_basename,
+                spec_filename=spec_basename,
             )
 
     return UploadMatch(
         accepted=True,
         case_id="uploaded",
-        case_title="Uploaded design verification",
+        case_title="Spec-driven design verification",
         message=(
-            f"Ready: `{design_basename}` will be compiled and verified using "
-            f"the uploaded testbench `{test_basename}`."
+            f"Ready: `{design_basename}` will be checked against "
+            f"`{spec_basename}` using the prototype generated FIFO testbench."
         ),
         filename=design_basename,
-        test_filename=test_basename,
+        spec_filename=spec_basename,
     )
 
 

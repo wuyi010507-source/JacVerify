@@ -17,7 +17,7 @@ import from jacverify.tool_adapter {
     lint_compile,
     llm_backend,
     llm_mode,
-    load_spec,
+    load_uploaded_spec,
     materialize_uploaded_inputs,
     make_artifact_draft,
     make_hypothesis_draft,
@@ -138,8 +138,10 @@ node Run {
         case_id: str = "",
         case_title: str = "",
         uploaded_filename: str = "",
+        uploaded_spec_filename: str = "",
         uploaded_test_filename: str = "",
         input_design_path: str = "",
+        input_spec_path: str = "",
         input_test_path: str = "",
         testbench_name: str = "",
         reviewed_candidate_available: bool = False,
@@ -300,6 +302,7 @@ obj DemoRunResult {
         case_id: str = "",
         case_title: str = "",
         uploaded_filename: str = "",
+        uploaded_spec_filename: str = "",
         uploaded_test_filename: str = "",
         coverage_available: bool = False,
         code_coverage: float = 0.0,
@@ -314,7 +317,8 @@ obj UploadPreview {
         case_title: str,
         message: str,
         filename: str,
-        test_filename: str,
+        spec_filename: str,
+        generated_test_filename: str,
         curated_hint: str;
 }
 
@@ -728,6 +732,7 @@ def build_demo_result(run: Run) -> DemoRunResult {
         case_id=run.case_id,
         case_title=run.case_title,
         uploaded_filename=run.uploaded_filename,
+        uploaded_spec_filename=run.uploaded_spec_filename,
         uploaded_test_filename=run.uploaded_test_filename,
         coverage_available=run.coverage_available,
         code_coverage=run.code_coverage,
@@ -756,7 +761,8 @@ def rejected_upload_result(upload_match: UploadMatch) -> DemoRunResult {
         case_id="",
         case_title="",
         uploaded_filename=upload_match.filename,
-        uploaded_test_filename=upload_match.test_filename,
+        uploaded_spec_filename=upload_match.spec_filename,
+        uploaded_test_filename=upload_match.generated_test_filename,
         upload_accepted=False
     );
 }
@@ -766,18 +772,19 @@ def run_case_pipeline(
     case_title: str,
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str
+    spec_filename: str,
+    spec_content: str
 ) -> DemoRunResult {
     workspace_root = os.getcwd();
     run_id = new_run_id();
     output_dir = os.path.join(workspace_root, "runs", run_id);
     inputs: UploadedInputPaths = materialize_uploaded_inputs(
+        workspace_root,
         output_dir,
         design_filename,
         design_content,
-        test_filename,
-        test_content
+        spec_filename,
+        spec_content
     );
     run = root ++> Run(
         run_id=run_id,
@@ -792,8 +799,10 @@ def run_case_pipeline(
         case_id=case_id,
         case_title=case_title,
         uploaded_filename=design_filename,
-        uploaded_test_filename=test_filename,
+        uploaded_spec_filename=spec_filename,
+        uploaded_test_filename=os.path.basename(inputs.test_path),
         input_design_path=inputs.design_path,
+        input_spec_path=inputs.spec_path,
         input_test_path=inputs.test_path,
         module_name=inputs.design_module,
         module_path=inputs.design_path,
@@ -956,8 +965,12 @@ walker LoadInputsWalker {
             skip;
         }
         try {
-            if not here.input_design_path or not here.input_test_path {
-                raise ValueError("Uploaded design/test paths are missing");
+            if (
+                not here.input_design_path
+                or not here.input_spec_path
+                or not here.input_test_path
+            ) {
+                raise ValueError("Uploaded design/spec or generated test path is missing");
             }
             module_node = here +>:OwnsModule:+> Module(
                 module_name=here.module_name,
@@ -965,27 +978,21 @@ walker LoadInputsWalker {
                 run_id=here.run_id,
                 source_walker="LoadInputsWalker"
             );
-            evidence_ids = [here.input_design_path, here.input_test_path];
-            if here.case_id == "fifo" {
-                spec: SpecLoadResult = load_spec(here.workspace_root);
-                here.requirement_count = spec.requirement_count;
-                for req in spec.requirements {
-                    here +>:OwnsRequirement:+> Requirement(
-                        req_id=req.req_id,
-                        text=req.text,
-                        run_id=here.run_id,
-                        source_walker="LoadInputsWalker"
-                    );
-                }
-                evidence_ids.append(spec.spec_path);
-            } else {
-                here.requirement_count = 1;
+            evidence_ids = [
+                here.input_design_path,
+                here.input_spec_path,
+                here.input_test_path
+            ];
+            spec: SpecLoadResult = load_uploaded_spec(
+                here.input_spec_path,
+                here.input_design_path,
+                here.module_name
+            );
+            here.requirement_count = spec.requirement_count;
+            for req in spec.requirements {
                 here +>:OwnsRequirement:+> Requirement(
-                    req_id="REQ-UPLOADED-TEST",
-                    text=(
-                        "The uploaded testbench defines the executable "
-                        "pass/fail contract for this run."
-                    ),
+                    req_id=req.req_id,
+                    text=req.text,
                     run_id=here.run_id,
                     source_walker="LoadInputsWalker"
                 );
@@ -994,10 +1001,11 @@ walker LoadInputsWalker {
                 here,
                 "S0_SPEC_INGEST",
                 "S3_STATIC_CHECK",
-                "design_and_test_loaded",
+                "design_spec_and_test_loaded",
                 (
-                    f"Loaded design module {here.module_name} and uploaded "
-                    f"testbench {here.testbench_name}."
+                    f"Loaded design module {here.module_name} and spec "
+                    f"{here.uploaded_spec_filename}; generated testbench "
+                    f"{here.testbench_name}."
                 ),
                 "tool_fact",
                 evidence_ids,
@@ -1127,7 +1135,7 @@ walker SimulateWalker {
         uploaded_test = here +>:Executes:+> Test(
             test_id=here.run_id + ":uploaded-test",
             name=here.testbench_name,
-            kind="uploaded",
+            kind="generated",
             status=regression.status,
             stdout=regression.stdout,
             coverage_available=coverage.available,
@@ -1149,7 +1157,7 @@ walker SimulateWalker {
                 "S6_REGRESSION",
                 "uploaded_test_failed",
                 (
-                    f"Uploaded testbench {here.testbench_name} reported "
+                    f"Generated testbench {here.testbench_name} reported "
                     "VERIFICATION_FAILED."
                 ),
                 "tool_fact",
@@ -1175,7 +1183,7 @@ walker SimulateWalker {
                 "S4_COMPILE_ELAB",
                 "S9_SIGNOFF_GATE",
                 "uploaded_test_passed",
-                f"Uploaded testbench {here.testbench_name} passed.",
+                f"Generated testbench {here.testbench_name} passed.",
                 "tool_fact",
                 [f"status:{regression.status}"],
                 "SimulateWalker"
@@ -1185,7 +1193,7 @@ walker SimulateWalker {
                 "S9_SIGNOFF_GATE",
                 "DONE",
                 "evidence_trace_complete",
-                "Uploaded design/test evidence is ready for inspection.",
+                "Design/spec/generated-test evidence is ready for inspection.",
                 "tool_fact",
                 ["graph:/graph", f"run:{here.run_id}"],
                 "SimulateWalker"
@@ -1324,7 +1332,7 @@ walker RankHypothesesWalker {
             request_user_review(
                 here,
                 (
-                    "The uploaded test failed and its evidence was captured. "
+                    "The generated test failed and its evidence was captured. "
                     "Automatic remediation is disabled because this design has "
                     "no reviewed candidate fixture."
                 ),
@@ -1929,16 +1937,16 @@ def:pub get_dashboard -> DashboardData {
 def:pub preview_uploaded_inputs(
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str
+    spec_filename: str,
+    spec_content: str
 ) -> UploadPreview {
     workspace_root = os.getcwd();
     upload_match: UploadMatch = identify_uploaded_inputs(
         workspace_root,
         design_filename,
         design_content,
-        test_filename,
-        test_content
+        spec_filename,
+        spec_content
     );
     return UploadPreview(
         accepted=upload_match.accepted,
@@ -1946,10 +1954,11 @@ def:pub preview_uploaded_inputs(
         case_title=upload_match.case_title,
         message=upload_match.message,
         filename=upload_match.filename,
-        test_filename=upload_match.test_filename,
+        spec_filename=upload_match.spec_filename,
+        generated_test_filename=upload_match.generated_test_filename,
         curated_hint=(
-            "Any SystemVerilog design/test pair can run. Automatic repair "
-            "remains limited to reviewed fixtures."
+            "Prototype mode generates the FIFO wraparound testbench from the "
+            "uploaded spec. Automatic repair remains limited to reviewed fixtures."
         )
     );
 }
@@ -1957,29 +1966,29 @@ def:pub preview_uploaded_inputs(
 def:pub preview_curated_inputs -> UploadPreview {
     workspace_root = os.getcwd();
     design_path = os.path.join(workspace_root, "demo", "fifo", "fifo_buggy.sv");
-    test_path = os.path.join(workspace_root, "demo", "fifo", "tb_wrap.sv");
+    spec_path = os.path.join(workspace_root, "demo", "fifo", "fifo_spec.md");
     return preview_uploaded_inputs(
         "fifo_buggy.sv",
         read_text_file(design_path),
-        "tb_wrap.sv",
-        read_text_file(test_path)
+        "fifo_spec.md",
+        read_text_file(spec_path)
     );
 }
 
-# Upload-driven entry: the simulator receives exactly these two file contents.
+# Upload-driven entry: the tool receives design/spec and injects a prototype test.
 def:pub run_uploaded_inputs(
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str
+    spec_filename: str,
+    spec_content: str
 ) -> DemoRunResult {
     workspace_root = os.getcwd();
     upload_match: UploadMatch = identify_uploaded_inputs(
         workspace_root,
         design_filename,
         design_content,
-        test_filename,
-        test_content
+        spec_filename,
+        spec_content
     );
     if not upload_match.accepted {
         return rejected_upload_result(upload_match);
@@ -1989,20 +1998,20 @@ def:pub run_uploaded_inputs(
         upload_match.case_title,
         upload_match.filename,
         design_content,
-        upload_match.test_filename,
-        test_content
+        upload_match.spec_filename,
+        spec_content
     );
 }
 
-# Convenience path: loads both curated files through the same generic pair API.
+# Convenience path: loads curated design/spec through the same generic pair API.
 def:pub run_fifo_demo -> DemoRunResult {
     workspace_root = os.getcwd();
     design_path = os.path.join(workspace_root, "demo", "fifo", "fifo_buggy.sv");
-    test_path = os.path.join(workspace_root, "demo", "fifo", "tb_wrap.sv");
+    spec_path = os.path.join(workspace_root, "demo", "fifo", "fifo_spec.md");
     return run_uploaded_inputs(
         "fifo_buggy.sv",
         read_text_file(design_path),
-        "tb_wrap.sv",
-        read_text_file(test_path)
+        "fifo_spec.md",
+        read_text_file(spec_path)
     );
 }

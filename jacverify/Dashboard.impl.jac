@@ -1,9 +1,9 @@
 """Client handler implementations for the JacVerify dashboard."""
 
 impl Dashboard.run_demo {
-    if not curated_session and (not design_content or not test_content) {
+    if not curated_session and (not design_content or not spec_content) {
         error_message = (
-            "Upload both a design file and a testbench before running verification."
+            "Upload both a design file and a specification before running verification."
         );
         return;
     }
@@ -16,8 +16,8 @@ impl Dashboard.run_demo {
             else await run_uploaded_inputs(
                 design_filename,
                 design_content,
-                test_filename,
-                test_content
+                spec_filename,
+                spec_content
             )
         );
         demo_run = result;
@@ -44,13 +44,13 @@ impl Dashboard.use_curated_sample {
             if result.uploaded_filename
             else "fifo_buggy.sv"
         );
-        test_filename = (
-            result.uploaded_test_filename
-            if result.uploaded_test_filename
-            else "tb_wrap.sv"
+        spec_filename = (
+            result.uploaded_spec_filename
+            if result.uploaded_spec_filename
+            else "fifo_spec.md"
         );
         design_content = "";
-        test_content = "";
+        spec_content = "";
         upload_preview = preview;
         if result.status == "blocked" {
             error_message = result.stop_reason;
@@ -77,12 +77,12 @@ impl Dashboard.on_design_file_change(e: any) {
         selected_content: str = await file.text();
         design_filename = selected_name;
         design_content = selected_content;
-        if test_content {
+        if spec_content {
             preview: UploadPreview = await preview_uploaded_inputs(
                 selected_name,
                 selected_content,
-                test_filename,
-                test_content
+                spec_filename,
+                spec_content
             );
             upload_preview = preview;
             if not preview.accepted {
@@ -99,7 +99,7 @@ impl Dashboard.on_design_file_change(e: any) {
     reading_upload = False;
 }
 
-impl Dashboard.on_test_file_change(e: any) {
+impl Dashboard.on_spec_file_change(e: any) {
     reading_upload = True;
     error_message = "";
     demo_run = None;
@@ -113,8 +113,8 @@ impl Dashboard.on_test_file_change(e: any) {
         file = file_list[0];
         selected_name: str = file.name;
         selected_content: str = await file.text();
-        test_filename = selected_name;
-        test_content = selected_content;
+        spec_filename = selected_name;
+        spec_content = selected_content;
         if design_content {
             preview: UploadPreview = await preview_uploaded_inputs(
                 design_filename,
@@ -130,9 +130,9 @@ impl Dashboard.on_test_file_change(e: any) {
             upload_preview = None;
         }
     } except Exception as err {
-        error_message = "Could not read the testbench file: " + str(err);
+        error_message = "Could not read the specification file: " + str(err);
         upload_preview = None;
-        test_content = "";
+        spec_content = "";
     }
     reading_upload = False;
 }
@@ -146,9 +146,9 @@ impl Dashboard.clear_design(_e: MouseEvent) {
     curated_session = False;
 }
 
-impl Dashboard.clear_test(_e: MouseEvent) {
-    test_filename = "";
-    test_content = "";
+impl Dashboard.clear_spec(_e: MouseEvent) {
+    spec_filename = "";
+    spec_content = "";
     upload_preview = None;
     demo_run = None;
     error_message = "";

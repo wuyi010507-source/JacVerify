@@ -52,6 +52,7 @@ class CoverageResult:
 
 class UploadedInputPaths:
     design_path: str
+    spec_path: str
     test_path: str
     design_module: str
     test_module: str
@@ -89,6 +90,9 @@ def tools_mode() -> str: ...
 def llm_mode() -> str: ...
 def llm_backend() -> str: ...
 def load_spec(workspace_root: str) -> SpecLoadResult: ...
+def load_uploaded_spec(
+    spec_path: str, module_path: str, module_name: str
+) -> SpecLoadResult: ...
 def lint_compile(
     workspace_root: str,
     output_dir: str,
@@ -113,11 +117,12 @@ def run_reverify(
 ) -> ToolResult: ...
 def coverage_from_result(result: ToolResult) -> CoverageResult: ...
 def materialize_uploaded_inputs(
+    workspace_root: str,
     output_dir: str,
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str,
+    spec_filename: str,
+    spec_content: str,
 ) -> UploadedInputPaths: ...
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None: ...
 def parse_failure_from_stored(
@@ -163,7 +168,8 @@ class UploadMatch:
     case_title: str
     message: str
     filename: str
-    test_filename: str
+    spec_filename: str
+    generated_test_filename: str
 
 
 def identify_uploaded_case(
@@ -173,8 +179,8 @@ def identify_uploaded_inputs(
     workspace_root: str,
     design_filename: str,
     design_content: str,
-    test_filename: str,
-    test_content: str,
+    spec_filename: str,
+    spec_content: str,
 ) -> UploadMatch: ...
 def load_curated_case_upload(
     workspace_root: str, case_id: str = "fifo"

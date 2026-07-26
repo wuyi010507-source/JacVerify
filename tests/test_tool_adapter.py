@@ -200,45 +200,48 @@ def test_upload_matches_curated_fifo_by_content() -> None:
     assert curated.filename == "fifo_buggy.sv"
 
 
-def test_design_and_test_uploads_are_independent(tmp_path: Path) -> None:
+def test_design_and_spec_uploads_generate_a_testbench(tmp_path: Path) -> None:
     workspace = Path(__file__).resolve().parents[1]
     design = (workspace / "demo" / "fifo" / "fifo_buggy.sv").read_text(
         encoding="utf-8"
     )
-    testbench = (workspace / "demo" / "fifo" / "tb_wrap.sv").read_text(
+    spec = (workspace / "demo" / "fifo" / "fifo_spec.md").read_text(
         encoding="utf-8"
     )
     generic_design = "module adder; endmodule\n"
-    generic_test = "module adder_test; initial $finish; endmodule\n"
+    generic_spec = "# Adder requirements\n\nThe output must equal the sum.\n"
 
     curated = identify_uploaded_inputs(
         str(workspace),
         "design.sv",
         design,
-        "test.sv",
-        testbench,
+        "fifo_spec.md",
+        spec,
     )
     generic = identify_uploaded_inputs(
         str(workspace),
         "adder.sv",
         generic_design,
-        "adder_test.sv",
-        generic_test,
+        "adder_spec.md",
+        generic_spec,
     )
     paths = materialize_uploaded_inputs(
+        str(workspace),
         str(tmp_path),
         "adder.sv",
         generic_design,
-        "adder_test.sv",
-        generic_test,
+        "adder_spec.md",
+        generic_spec,
     )
 
     assert curated.accepted and curated.case_id == "fifo"
     assert generic.accepted and generic.case_id == "uploaded"
     assert Path(paths.design_path).read_text(encoding="utf-8") == generic_design
-    assert Path(paths.test_path).read_text(encoding="utf-8") == generic_test
+    assert Path(paths.spec_path).read_text(encoding="utf-8") == generic_spec
+    assert "module tb_wrap" in Path(paths.test_path).read_text(encoding="utf-8")
+    assert Path(paths.test_path).name == "generated_tb_wrap.sv"
     assert paths.design_module == "adder"
-    assert paths.test_module == "adder_test"
+    assert paths.test_module == "tb_wrap"
 
 
 def test_coverage_marker_is_parsed_from_test_output(tmp_path: Path) -> None:

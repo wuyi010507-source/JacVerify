@@ -141,7 +141,8 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert first_run.max_debug_attempts == 3;
     assert first_run.selected_hypothesis_rank == 1;
     assert not first_run.needs_user_review;
-    assert first_run.uploaded_test_filename == "tb_wrap.sv";
+    assert first_run.uploaded_spec_filename == "fifo_spec.md";
+    assert first_run.uploaded_test_filename == "generated_tb_wrap.sv";
     assert first_run.coverage_available;
     assert first_run.code_coverage == 91.0;
     assert first_run.functional_coverage == 100.0;
@@ -279,30 +280,30 @@ test "dashboard endpoint still returns project recommendations" {
     assert len(dashboard.recommendations) == 3;
 }
 
-test "upload path runs an independent design and test pair" {
+test "upload path accepts design and spec and generates a test" {
     workspace = os.getcwd();
     buggy = read_text_file(
         os.path.join(workspace, "demo", "fifo", "fifo_buggy.sv")
     );
-    testbench = read_text_file(
-        os.path.join(workspace, "demo", "fifo", "tb_wrap.sv")
+    spec = read_text_file(
+        os.path.join(workspace, "demo", "fifo", "fifo_spec.md")
     );
     preview = preview_uploaded_inputs(
         "uploaded_fifo.sv",
         buggy,
-        "uploaded_tb.sv",
-        testbench
+        "uploaded_spec.md",
+        spec
     );
     accepted = run_uploaded_inputs(
         "uploaded_fifo.sv",
         buggy,
-        "uploaded_tb.sv",
-        testbench
+        "uploaded_spec.md",
+        spec
     );
     rejected = run_uploaded_inputs(
         "random.sv",
         "module nope; endmodule\n",
-        "empty_test.sv",
+        "empty_spec.md",
         ""
     );
 
@@ -312,24 +313,26 @@ test "upload path runs an independent design and test pair" {
     assert accepted.upload_accepted;
     assert accepted.case_id == "fifo";
     assert accepted.uploaded_filename == "uploaded_fifo.sv";
-    assert accepted.uploaded_test_filename == "uploaded_tb.sv";
+    assert accepted.uploaded_spec_filename == "uploaded_spec.md";
+    assert accepted.uploaded_test_filename == "generated_tb_wrap.sv";
     assert rejected.status == "blocked";
     assert not rejected.upload_accepted;
-    assert "testbench" in rejected.stop_reason;
+    assert "specification" in rejected.stop_reason;
 }
 
-test "unrecognized design and test pair never receives the FIFO fix" {
+test "unrecognized design and spec never receives the FIFO fix" {
     result = run_uploaded_inputs(
         "adder.sv",
         "module adder; endmodule\n",
-        "adder_check.sv",
-        "module adder_check; initial $finish; endmodule\n"
+        "adder_spec.md",
+        "# Adder\n\nThe output must equal the sum.\n"
     );
 
     assert result.upload_accepted;
     assert result.case_id == "uploaded";
     assert result.uploaded_filename == "adder.sv";
-    assert result.uploaded_test_filename == "adder_check.sv";
+    assert result.uploaded_spec_filename == "adder_spec.md";
+    assert result.uploaded_test_filename == "generated_tb_wrap.sv";
     assert result.current_state == "NEEDS_USER_REVIEW";
     assert result.needs_user_review;
     assert result.debug_attempt == 0;
