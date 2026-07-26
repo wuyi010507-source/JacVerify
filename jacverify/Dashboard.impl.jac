@@ -44,10 +44,13 @@ impl Dashboard.use_curated_sample {
             case_title=result.case_title,
             message=(
                 "Loaded a curated sample through the upload product path. "
-                "You can also choose demo/fifo/fifo_buggy.sv from disk."
+                "You can also choose fifo/alu/shift_reg buggy RTL from disk."
             ),
             filename=selected_name,
-            curated_hint="Curated today: demo/fifo/fifo_buggy.sv"
+            curated_hint=(
+                "Curated today: demo/fifo/fifo_buggy.sv, "
+                "demo/alu/alu_buggy.sv, demo/shift_reg/shift_reg_buggy.sv"
+            )
         );
         if result.status == "blocked" {
             error_message = result.stop_reason;

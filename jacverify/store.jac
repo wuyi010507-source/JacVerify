@@ -22,6 +22,7 @@ import from jacverify.tool_adapter {
     run_reverify,
     run_smoke,
     run_wrap_regression,
+    set_active_case,
     tools_mode
 }
 
@@ -683,6 +684,7 @@ def run_case_pipeline(
     uploaded_filename: str
 ) -> DemoRunResult {
     workspace_root = os.getcwd();
+    set_active_case(case_id);
     output_dir = os.path.join(workspace_root, "runs", case_id + "-demo");
     run_id = new_run_id();
     run = root ++> Run(
@@ -1488,7 +1490,10 @@ def:pub preview_upload(filename: str, content: str) -> UploadPreview {
         case_title=upload_match.case_title,
         message=upload_match.message,
         filename=upload_match.filename,
-        curated_hint="Curated today: demo/fifo/fifo_buggy.sv"
+        curated_hint=(
+            "Curated today: demo/fifo/fifo_buggy.sv, "
+            "demo/alu/alu_buggy.sv, demo/shift_reg/shift_reg_buggy.sv"
+        )
     );
 }
 

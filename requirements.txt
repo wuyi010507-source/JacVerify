@@ -1,0 +1,16 @@
+# JacVerify Python dependencies
+# Install: pip install -r requirements.txt
+# Also run: jac install   (pulls Jac project + npm deps from jac.toml)
+#
+# ---------------------------------------------------------------------------
+# NOT installable via pip — install these on the host / container instead:
+#   macOS:   brew install icarus-verilog
+#   Ubuntu:  sudo apt-get install -y iverilog
+#   verify:  iverilog -V && vvp -V
+# Deploy images must include `iverilog` and `vvp` on PATH for live tool mode
+# (JACVERIFY_MOCK_TOOLS=0). Mock mode does not need them.
+# ---------------------------------------------------------------------------
+
+# Match jac.toml [dev-dependencies] / local test tooling
+pytest~=9.1
+watchdog>=3.0.0

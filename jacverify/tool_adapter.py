@@ -1,4 +1,4 @@
-"""Allow-listed FIFO tool adapter with explicit mock/live modes."""
+"""Allow-listed curated-case tool adapter with explicit mock/live modes."""
 
 from __future__ import annotations
 
@@ -19,9 +19,109 @@ STATUS_TOOL_ERROR = "TOOL_ERROR"
 STATUS_BUG_NOT_REPRODUCED = "BUG_NOT_REPRODUCED"
 STATUS_NOT_RUN = "NOT_RUN"
 
-WRAP_MISMATCH_RE = re.compile(
-    r"WRAP_MISMATCH\s+expected=([0-9A-Fa-f]+)\s+observed=([0-9A-Fa-f]+)"
+MISMATCH_RE = re.compile(
+    r"(WRAP_MISMATCH|ALU_MISMATCH|SHIFT_MISMATCH)\s+"
+    r"expected=([0-9A-Fa-fxX]+)\s+observed=([0-9A-Fa-fxX]+)"
 )
+WRAP_MISMATCH_RE = MISMATCH_RE  # backward-compatible alias
+
+_ACTIVE_CASE_ID = "fifo"
+
+
+@dataclass(frozen=True)
+class CaseConfig:
+    case_id: str
+    title: str
+    description: str
+    module_name: str
+    demo_dir: str
+    buggy_name: str
+    fixed_name: str
+    smoke_tb: str
+    directed_tb: str
+    spec_name: str
+    accepted_filenames: tuple[str, ...]
+    fail_tag: str
+    pass_tag: str
+    mock_fail_stdout: str
+    mock_pass_stdout: str
+
+
+CASE_CONFIGS: dict[str, CaseConfig] = {
+    "fifo": CaseConfig(
+        case_id="fifo",
+        title="FIFO wraparound",
+        description=(
+            "Module-level FIFO with a planted write-pointer wrap bug."
+        ),
+        module_name="fifo",
+        demo_dir="fifo",
+        buggy_name="fifo_buggy.sv",
+        fixed_name="fifo_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_wrap.sv",
+        spec_name="fifo_spec.md",
+        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
+        fail_tag="WRAP_MISMATCH",
+        pass_tag="WRAP_TEST_PASS",
+        mock_fail_stdout="WRAP_MISMATCH expected=55 observed=33\n",
+        mock_pass_stdout="WRAP_TEST_PASS\n",
+    ),
+    "alu": CaseConfig(
+        case_id="alu",
+        title="ALU subtract opcode",
+        description=(
+            "Small ALU where SUB incorrectly adds instead of subtracts."
+        ),
+        module_name="alu",
+        demo_dir="alu",
+        buggy_name="alu_buggy.sv",
+        fixed_name="alu_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="alu_spec.md",
+        accepted_filenames=("alu_buggy.sv", "alu.sv"),
+        fail_tag="ALU_MISMATCH",
+        pass_tag="ALU_TEST_PASS",
+        mock_fail_stdout="ALU_MISMATCH expected=05 observed=0b\n",
+        mock_pass_stdout="ALU_TEST_PASS\n",
+    ),
+    "shift_reg": CaseConfig(
+        case_id="shift_reg",
+        title="Shift-register direction",
+        description=(
+            "Shift register that shifts left instead of the specified right shift."
+        ),
+        module_name="shift_reg",
+        demo_dir="shift_reg",
+        buggy_name="shift_reg_buggy.sv",
+        fixed_name="shift_reg_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="shift_reg_spec.md",
+        accepted_filenames=("shift_reg_buggy.sv", "shift_reg.sv"),
+        fail_tag="SHIFT_MISMATCH",
+        pass_tag="SHIFT_TEST_PASS",
+        mock_fail_stdout="SHIFT_MISMATCH expected=40 observed=00\n",
+        mock_pass_stdout="SHIFT_TEST_PASS\n",
+    ),
+}
+
+
+def set_active_case(case_id: str) -> str:
+    global _ACTIVE_CASE_ID
+    if case_id not in CASE_CONFIGS:
+        raise ValueError(f"Unknown curated case_id: {case_id}")
+    _ACTIVE_CASE_ID = case_id
+    return case_id
+
+
+def get_active_case_id() -> str:
+    return _ACTIVE_CASE_ID
+
+
+def active_case() -> CaseConfig:
+    return CASE_CONFIGS[_ACTIVE_CASE_ID]
 
 
 @dataclass(frozen=True)
@@ -114,29 +214,35 @@ def _tool_error(
     )
 
 
-def _fifo_paths(workspace_root: str) -> dict[str, Path]:
+def _case_paths(workspace_root: str, case: CaseConfig | None = None) -> dict[str, Path]:
+    cfg = case or active_case()
     root = Path(workspace_root).resolve()
-    fifo_dir = root / "demo" / "fifo"
+    case_dir = root / "demo" / cfg.demo_dir
     paths = {
         "root": root,
-        "fifo_dir": fifo_dir,
-        "buggy_rtl": fifo_dir / "fifo_buggy.sv",
-        "fixed_rtl": fifo_dir / "fifo_fixed.sv",
-        "smoke_tb": fifo_dir / "tb_smoke.sv",
-        "wrap_tb": fifo_dir / "tb_wrap.sv",
-        "spec_path": fifo_dir / "fifo_spec.md",
+        "case_dir": case_dir,
+        "buggy_rtl": case_dir / cfg.buggy_name,
+        "fixed_rtl": case_dir / cfg.fixed_name,
+        "smoke_tb": case_dir / cfg.smoke_tb,
+        "wrap_tb": case_dir / cfg.directed_tb,
+        "spec_path": case_dir / cfg.spec_name,
     }
     for key in ("buggy_rtl", "fixed_rtl", "smoke_tb", "wrap_tb", "spec_path"):
         path = paths[key]
-        if not path.is_file() or fifo_dir not in path.parents:
+        if not path.is_file() or case_dir not in path.parents:
             raise FileNotFoundError(
-                f"FIFO demo input missing or outside allow-list: {path}"
+                f"Demo input missing or outside allow-list: {path}"
             )
     return paths
 
 
+def _fifo_paths(workspace_root: str) -> dict[str, Path]:
+    return _case_paths(workspace_root, CASE_CONFIGS["fifo"])
+
+
 def load_spec(workspace_root: str) -> SpecLoadResult:
-    paths = _fifo_paths(workspace_root)
+    cfg = active_case()
+    paths = _case_paths(workspace_root, cfg)
     requirements: list[RequirementItem] = []
     for line in paths["spec_path"].read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -151,25 +257,27 @@ def load_spec(workspace_root: str) -> SpecLoadResult:
             )
         )
     if len(requirements) != 5:
-        raise ValueError("FIFO demo specification must contain exactly five requirements")
+        raise ValueError(
+            f"{cfg.case_id} specification must contain exactly five requirements"
+        )
     return SpecLoadResult(
         requirement_count=len(requirements),
         spec_path=str(paths["spec_path"]),
         requirements=requirements,
         module_path=str(paths["buggy_rtl"]),
-        module_name="fifo",
+        module_name=cfg.module_name,
         mode=tools_mode(),
     )
 
 
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
-    match = WRAP_MISMATCH_RE.search(result.stdout or "")
+    match = MISMATCH_RE.search(result.stdout or "")
     if not match:
         return None
     return FailureEvidence(
-        kind="WRAP_MISMATCH",
-        expected=match.group(1),
-        observed=match.group(2),
+        kind=match.group(1),
+        expected=match.group(2),
+        observed=match.group(3),
         cycle=None,
         raw_stdout=result.stdout,
         source_result=result,
@@ -219,21 +327,30 @@ def parse_failure_from_stored(
 
 
 def _mock_compile() -> ToolResult:
+    cfg = active_case()
     return ToolResult(
         tool="iverilog",
         mode="mock",
         status=STATUS_PASSED,
         exit_code=0,
-        command=["mock:iverilog", "-g2012", "-tnull", "-s", "fifo", "fifo_buggy.sv"],
+        command=[
+            "mock:iverilog",
+            "-g2012",
+            "-tnull",
+            "-s",
+            cfg.module_name,
+            cfg.buggy_name,
+        ],
         duration_ms=1,
         stdout="mock lint/compile ok\n",
         stderr="",
         artifacts=[],
-        diagnostics={"stage": "compile"},
+        diagnostics={"stage": "compile", "case_id": cfg.case_id},
     )
 
 
 def _mock_smoke() -> ToolResult:
+    cfg = active_case()
     return ToolResult(
         tool="vvp",
         mode="mock",
@@ -244,40 +361,50 @@ def _mock_smoke() -> ToolResult:
         stdout="SMOKE_TEST_PASS\n",
         stderr="",
         artifacts=["mock:smoke.vvp"],
-        diagnostics={"stage": "smoke", "test": "tb_smoke"},
+        diagnostics={"stage": "smoke", "test": "tb_smoke", "case_id": cfg.case_id},
     )
 
 
 def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
+    cfg = active_case()
     if reproduce_bug:
-        stdout = "WRAP_MISMATCH expected=55 observed=33\n"
         return ToolResult(
             tool="vvp",
             mode="mock",
             status=STATUS_VERIFICATION_FAILED,
             exit_code=1,
-            command=["mock:vvp", "wrap_regression.vvp"],
+            command=["mock:vvp", "directed_regression.vvp"],
             duration_ms=2,
-            stdout=stdout,
+            stdout=cfg.mock_fail_stdout,
             stderr="",
-            artifacts=["mock:wrap_regression.vvp"],
-            diagnostics={"stage": "wrap_regression", "test": "tb_wrap"},
+            artifacts=["mock:directed_regression.vvp"],
+            diagnostics={
+                "stage": "directed_regression",
+                "test": cfg.directed_tb,
+                "case_id": cfg.case_id,
+            },
         )
     return ToolResult(
         tool="vvp",
         mode="mock",
         status=STATUS_BUG_NOT_REPRODUCED,
         exit_code=0,
-        command=["mock:vvp", "wrap_regression.vvp"],
+        command=["mock:vvp", "directed_regression.vvp"],
         duration_ms=2,
-        stdout="WRAP_TEST_PASS\n",
+        stdout=cfg.mock_pass_stdout,
         stderr="",
-        artifacts=["mock:wrap_regression.vvp"],
-        diagnostics={"stage": "wrap_regression", "test": "tb_wrap"},
+        artifacts=["mock:directed_regression.vvp"],
+        diagnostics={
+            "stage": "directed_regression",
+            "test": cfg.directed_tb,
+            "case_id": cfg.case_id,
+        },
     )
 
 
 def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
+    cfg = active_case()
+    candidate = f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
     if pass_result:
         return ToolResult(
             tool="vvp",
@@ -286,13 +413,14 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
             exit_code=0,
             command=["mock:vvp", "patched_reverify.vvp"],
             duration_ms=2,
-            stdout="WRAP_TEST_PASS\n",
+            stdout=cfg.mock_pass_stdout,
             stderr="",
             artifacts=["mock:patched_reverify.vvp"],
             diagnostics={
                 "stage": "patched_reverify",
-                "candidate": "demo/fifo/fifo_fixed.sv",
+                "candidate": candidate,
                 "candidate_kind": "reviewed_fixture",
+                "case_id": cfg.case_id,
             },
         )
     return ToolResult(
@@ -302,13 +430,14 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
         exit_code=1,
         command=["mock:vvp", "patched_reverify.vvp"],
         duration_ms=2,
-        stdout="WRAP_MISMATCH expected=55 observed=33\n",
+        stdout=cfg.mock_fail_stdout,
         stderr="",
         artifacts=["mock:patched_reverify.vvp"],
         diagnostics={
             "stage": "patched_reverify",
-            "candidate": "demo/fifo/fifo_fixed.sv",
+            "candidate": candidate,
             "candidate_kind": "reviewed_fixture",
+            "case_id": cfg.case_id,
         },
     )
 
@@ -373,6 +502,7 @@ def _ensure_output_dir(output_dir: str) -> Path:
 
 
 def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         return _mock_compile()
     if shutil.which("iverilog") is None:
@@ -384,7 +514,7 @@ def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
             stderr="iverilog not found on PATH",
             diagnostics={"error": "executable_not_found", "stage": "compile"},
         )
-    paths = _fifo_paths(workspace_root)
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _execute(
         tool="iverilog",
@@ -393,11 +523,11 @@ def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
             "-g2012",
             "-tnull",
             "-s",
-            "fifo",
+            cfg.module_name,
             str(paths["buggy_rtl"]),
         ],
         cwd=artifacts,
-        diagnostics={"stage": "compile"},
+        diagnostics={"stage": "compile", "case_id": cfg.case_id},
     )
     if result.status == STATUS_PASSED:
         return result
@@ -485,9 +615,10 @@ def _compile_and_simulate(
 
 
 def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         return _mock_smoke()
-    paths = _fifo_paths(workspace_root)
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="smoke",
@@ -514,20 +645,21 @@ def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
 
 
 def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         force = os.environ.get("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", "")
         return _mock_regression(reproduce_bug=force != "1")
-    paths = _fifo_paths(workspace_root)
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
-        stage="wrap_regression",
+        stage="directed_regression",
         rtl=paths["buggy_rtl"],
         testbench=paths["wrap_tb"],
         output_dir=artifacts,
     )
     if result.status == STATUS_TOOL_ERROR and result.diagnostics.get("error"):
         return result
-    if "WRAP_MISMATCH" in result.stdout:
+    if cfg.fail_tag in result.stdout:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -538,9 +670,13 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
             stdout=result.stdout,
             stderr=result.stderr,
             artifacts=result.artifacts,
-            diagnostics={**result.diagnostics, "stage": "wrap_regression"},
+            diagnostics={
+                **result.diagnostics,
+                "stage": "directed_regression",
+                "case_id": cfg.case_id,
+            },
         )
-    if "WRAP_TEST_PASS" in result.stdout or result.exit_code == 0:
+    if cfg.pass_tag in result.stdout or result.exit_code == 0:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -551,7 +687,11 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
             stdout=result.stdout,
             stderr=result.stderr,
             artifacts=result.artifacts,
-            diagnostics={**result.diagnostics, "stage": "wrap_regression"},
+            diagnostics={
+                **result.diagnostics,
+                "stage": "directed_regression",
+                "case_id": cfg.case_id,
+            },
         )
     return ToolResult(
         tool=result.tool,
@@ -565,17 +705,19 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
         artifacts=result.artifacts,
         diagnostics={
             **result.diagnostics,
-            "stage": "wrap_regression",
+            "stage": "directed_regression",
             "error": "malformed_output",
+            "case_id": cfg.case_id,
         },
     )
 
 
 def run_reverify(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
-    paths = _fifo_paths(workspace_root)
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="patched_reverify",
@@ -588,8 +730,9 @@ def run_reverify(workspace_root: str, output_dir: str) -> ToolResult:
         "stage": "patched_reverify",
         "candidate": str(paths["fixed_rtl"]),
         "candidate_kind": "reviewed_fixture",
+        "case_id": cfg.case_id,
     }
-    if result.status == STATUS_PASSED and "WRAP_TEST_PASS" in result.stdout:
+    if result.status == STATUS_PASSED and cfg.pass_tag in result.stdout:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -602,7 +745,7 @@ def run_reverify(workspace_root: str, output_dir: str) -> ToolResult:
             artifacts=result.artifacts,
             diagnostics=diagnostics,
         )
-    if "WRAP_MISMATCH" in result.stdout:
+    if cfg.fail_tag in result.stdout:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -648,9 +791,62 @@ class ArtifactDraft:
 
 
 def rank_hypotheses_mock(failure: FailureEvidence) -> list[HypothesisDraft]:
-    """Deterministic diagnosis aligned with the planted write-pointer wrap bug."""
+    """Deterministic diagnosis aligned with the active curated case's planted bug."""
+    cfg = active_case()
     expected = failure.expected or "?"
     observed = failure.observed or "?"
+    if cfg.case_id == "alu":
+        return [
+            HypothesisDraft(
+                rank=1,
+                claim=(
+                    "SUB opcode incorrectly computes a+b instead of a-b "
+                    f"(expected={expected}, observed={observed})."
+                ),
+                confidence=0.91,
+                next_action=(
+                    "Apply reviewed ALU SUB fix fixture and reverify."
+                ),
+            ),
+            HypothesisDraft(
+                rank=2,
+                claim="ADD opcode wraps incorrectly on overflow.",
+                confidence=0.16,
+                next_action="Compare ADD vectors against wrap semantics.",
+            ),
+            HypothesisDraft(
+                rank=3,
+                claim="Registered result updates one cycle late relative to opcode.",
+                confidence=0.08,
+                next_action="Inspect always_ff sampling against tb_directed timing.",
+            ),
+        ]
+    if cfg.case_id == "shift_reg":
+        return [
+            HypothesisDraft(
+                rank=1,
+                claim=(
+                    "Shift direction is inverted: register shifts left instead of "
+                    f"right (expected={expected}, observed={observed})."
+                ),
+                confidence=0.91,
+                next_action=(
+                    "Apply reviewed right-shift fix fixture and reverify."
+                ),
+            ),
+            HypothesisDraft(
+                rank=2,
+                claim="serial_in is wired into the LSB instead of the MSB on shift.",
+                confidence=0.17,
+                next_action="Trace serial_in concatenation in the shift branch.",
+            ),
+            HypothesisDraft(
+                rank=3,
+                claim="load path corrupts q before the directed shift sequence.",
+                confidence=0.07,
+                next_action="Check load vs shift priority against the smoke test.",
+            ),
+        ]
     return [
         HypothesisDraft(
             rank=1,
@@ -682,15 +878,17 @@ def generate_artifact_mock(
     hypothesis: HypothesisDraft,
     module_name: str,
 ) -> ArtifactDraft:
+    cfg = active_case()
+    candidate_path = f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
     return ArtifactDraft(
         kind="reviewed_candidate_fixture",
         description=(
-            f"Directed wraparound reverify artifact for module `{module_name}`: "
-            "apply pre-reviewed candidate `demo/fifo/fifo_fixed.sv` that restores "
-            "write_ptr wrap-to-zero, then rerun tb_wrap."
+            f"Directed reverify artifact for module `{module_name}`: "
+            f"apply pre-reviewed candidate `{candidate_path}`, then rerun "
+            f"{cfg.directed_tb}."
         ),
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="reviewed_fixture:fifo_fixed.sv",
+        candidate_path=candidate_path,
+        candidate_label=f"reviewed_fixture:{cfg.fixed_name}",
         hypothesis_claim=hypothesis.claim,
         notes=(
             "Candidate is a pre-reviewed fixture, not an LLM-authored RTL patch."
@@ -782,17 +980,18 @@ class UploadMatch:
     filename: str
 
 
-CURATED_CASES: tuple[CuratedCase, ...] = (
+CURATED_CASES: tuple[CuratedCase, ...] = tuple(
     CuratedCase(
-        case_id="fifo",
-        title="FIFO wraparound",
+        case_id=cfg.case_id,
+        title=cfg.title,
         description=(
-            "Module-level FIFO with a planted write-pointer wrap bug. "
-            "Hackathon demo uses a reviewed fix fixture for re-verification."
+            f"{cfg.description} Hackathon demo uses a reviewed fix fixture "
+            "for re-verification."
         ),
-        buggy_relpath="demo/fifo/fifo_buggy.sv",
-        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
-    ),
+        buggy_relpath=f"demo/{cfg.demo_dir}/{cfg.buggy_name}",
+        accepted_filenames=cfg.accepted_filenames,
+    )
+    for cfg in CASE_CONFIGS.values()
 )
 
 
@@ -862,7 +1061,8 @@ def identify_uploaded_case(
             "This upload is not one of today's curated demo cases. "
             "JacVerify's upload path is enabled, but the hackathon runtime "
             f"only executes prepared designs ({known}). "
-            "Try uploading demo/fifo/fifo_buggy.sv."
+            "Try uploading demo/fifo/fifo_buggy.sv, demo/alu/alu_buggy.sv, "
+            "or demo/shift_reg/shift_reg_buggy.sv."
         ),
         filename=basename,
     )

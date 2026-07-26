@@ -191,8 +191,10 @@ def:pub Dashboard -> JsxElement {
                         <div className="empty-icon">⬆</div>
                         <h3>Upload a design to begin</h3>
                         <p>
-                            For today's demo, upload <code>demo/fifo/fifo_buggy.sv</code> or
-                            click <strong>Use curated sample</strong>. Mock mode:
+                            For today's demo, upload <code>demo/fifo/fifo_buggy.sv</code>,
+                            <code>demo/alu/alu_buggy.sv</code>, or
+                            <code>demo/shift_reg/shift_reg_buggy.sv</code>, or click
+                            <strong>Use curated sample</strong>. Mock mode:
                             JACVERIFY_MOCK_TOOLS=1 JACVERIFY_MOCK_LLM=1.
                         </p>
                     </div>
