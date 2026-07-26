@@ -268,3 +268,23 @@ test "dashboard endpoint still returns project recommendations" {
     assert dashboard.root_cause_clusters == 3;
     assert len(dashboard.recommendations) == 3;
 }
+
+test "upload path accepts curated FIFO content and rejects unknown RTL" {
+    workspace = os.getcwd();
+    buggy = read_text_file(
+        os.path.join(workspace, "demo", "fifo", "fifo_buggy.sv")
+    );
+    preview = preview_upload("uploaded_fifo.sv", buggy);
+    accepted = run_uploaded_design("uploaded_fifo.sv", buggy);
+    rejected = run_uploaded_design("random.sv", "module nope; endmodule\n");
+
+    assert preview.accepted;
+    assert preview.case_id == "fifo";
+    assert accepted.current_state == "DONE";
+    assert accepted.upload_accepted;
+    assert accepted.case_id == "fifo";
+    assert accepted.uploaded_filename == "uploaded_fifo.sv";
+    assert rejected.status == "blocked";
+    assert not rejected.upload_accepted;
+    assert "curated" in rejected.stop_reason or "Curated" in rejected.stop_reason;
+}

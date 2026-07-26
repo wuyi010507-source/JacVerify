@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1093,6 +1094,145 @@ def make_artifact_draft(
 
 def fresh_run_id(prefix: str = "fifo-run") -> str:
     return f"{prefix}-{int(time.time() * 1000)}"
+
+
+def normalize_source(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+
+
+def source_fingerprint(text: str) -> str:
+    return hashlib.sha256(normalize_source(text).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class CuratedCase:
+    case_id: str
+    title: str
+    description: str
+    buggy_relpath: str
+    accepted_filenames: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UploadMatch:
+    accepted: bool
+    case_id: str
+    case_title: str
+    message: str
+    filename: str
+
+
+CURATED_CASES: tuple[CuratedCase, ...] = (
+    CuratedCase(
+        case_id="fifo",
+        title="FIFO wraparound",
+        description=(
+            "Module-level FIFO with a planted write-pointer wrap bug. "
+            "Hackathon demo uses a reviewed fix fixture for re-verification."
+        ),
+        buggy_relpath="demo/fifo/fifo_buggy.sv",
+        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
+    ),
+)
+
+
+def list_curated_cases() -> list[dict[str, str]]:
+    return [
+        {
+            "case_id": case.case_id,
+            "title": case.title,
+            "description": case.description,
+            "buggy_relpath": case.buggy_relpath,
+            "accepted_filenames": ", ".join(case.accepted_filenames),
+        }
+        for case in CURATED_CASES
+    ]
+
+
+def _case_buggy_text(workspace_root: str, case: CuratedCase) -> str:
+    path = Path(workspace_root).resolve() / case.buggy_relpath
+    if not path.is_file():
+        raise FileNotFoundError(f"Curated case RTL missing: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def identify_uploaded_case(
+    workspace_root: str,
+    filename: str,
+    content: str,
+) -> UploadMatch:
+    """Match an uploaded design against curated hackathon cases.
+
+    Upload UX is real; execution remains allow-listed to prepared cases.
+    """
+    basename = Path(filename or "").name.strip() or "upload.sv"
+    if not content or not content.strip():
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message="Upload is empty. Choose an RTL design file to continue.",
+            filename=basename,
+        )
+
+    upload_fp = source_fingerprint(content)
+    for case in CURATED_CASES:
+        try:
+            curated_fp = source_fingerprint(_case_buggy_text(workspace_root, case))
+        except FileNotFoundError:
+            continue
+        if upload_fp == curated_fp:
+            return UploadMatch(
+                accepted=True,
+                case_id=case.case_id,
+                case_title=case.title,
+                message=(
+                    f"Matched curated case `{case.title}` from upload "
+                    f"`{basename}`. Ready to run the verification loop."
+                ),
+                filename=basename,
+            )
+
+    known = ", ".join(case.buggy_relpath for case in CURATED_CASES)
+    return UploadMatch(
+        accepted=False,
+        case_id="",
+        case_title="",
+        message=(
+            "This upload is not one of today's curated demo cases. "
+            "JacVerify's upload path is enabled, but the hackathon runtime "
+            f"only executes prepared designs ({known}). "
+            "Try uploading demo/fifo/fifo_buggy.sv."
+        ),
+        filename=basename,
+    )
+
+
+def read_text_file(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+def load_curated_case_upload(
+    workspace_root: str,
+    case_id: str = "fifo",
+) -> UploadMatch:
+    """Server-side helper: treat a curated case as if the user uploaded it."""
+    for case in CURATED_CASES:
+        if case.case_id != case_id:
+            continue
+        text = _case_buggy_text(workspace_root, case)
+        return identify_uploaded_case(
+            workspace_root,
+            Path(case.buggy_relpath).name,
+            text,
+        )
+    return UploadMatch(
+        accepted=False,
+        case_id="",
+        case_title="",
+        message=f"Unknown curated case_id: {case_id}",
+        filename="",
+    )
 
 
 def tool_result_to_dict(result: ToolResult) -> dict[str, Any]:

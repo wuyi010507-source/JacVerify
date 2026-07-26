@@ -71,9 +71,15 @@ JACVERIFY_MOCK_LLM=1 \
 jac start --dev main.jac
 ```
 
-Open [http://localhost:8000](http://localhost:8000), stay on **FIFO evidence loop**, click **Run seven-walker loop**.
+Open [http://localhost:8000](http://localhost:8000).
 
-Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
+Upload path (product UX):
+
+1. Choose `demo/fifo/fifo_buggy.sv` in **Design upload**, or click **Use curated sample**.
+2. Click **Run verification loop**.
+3. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
+
+Uploads are real file reads. Execution is allow-listed to curated hackathon cases so the demo stays reliable. Unknown RTL is rejected with an explicit message (no silent fallback).
 
 For a terminal-only demo:
 

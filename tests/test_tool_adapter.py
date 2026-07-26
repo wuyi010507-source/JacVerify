@@ -10,7 +10,9 @@ from jacverify.tool_adapter import (
     STATUS_TOOL_ERROR,
     STATUS_VERIFICATION_FAILED,
     generate_artifact,
+    identify_uploaded_case,
     lint_compile,
+    load_curated_case_upload,
     load_spec,
     parse_failure_evidence,
     rank_hypotheses,
@@ -179,3 +181,17 @@ def test_firecrawl_live_adapter_requires_local_key(
 
     with pytest.raises(RuntimeError, match="FIRECRAWL_API_KEY is empty"):
         tool_adapter._firecrawl_agent(prompt="test", schema={"type": "object"})
+
+
+def test_upload_matches_curated_fifo_by_content() -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    buggy = (workspace / "demo" / "fifo" / "fifo_buggy.sv").read_text(encoding="utf-8")
+    matched = identify_uploaded_case(str(workspace), "my_fifo.sv", buggy)
+    rejected = identify_uploaded_case(str(workspace), "random.sv", "module x; endmodule\n")
+    curated = load_curated_case_upload(str(workspace), "fifo")
+
+    assert matched.accepted
+    assert matched.case_id == "fifo"
+    assert not rejected.accepted
+    assert curated.accepted
+    assert curated.filename == "fifo_buggy.sv"
