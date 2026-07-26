@@ -119,19 +119,66 @@ test "state executor completes an evidence-labelled FIFO debug loop" {
     assert transitions[9].to_state == "DONE";
 }
 
-test "public demo data stays complete across repeated reads" {
-    dashboard = get_dashboard();
+test "seven walkers mock pipeline reaches DONE with structured evidence" {
     first_run = run_fifo_demo();
     second_run = run_fifo_demo();
 
+    assert first_run.job_id != second_run.job_id;
+    assert first_run.current_state == "DONE";
+    assert first_run.status == "complete";
+    assert first_run.tool_mode == "mock";
+    assert first_run.llm_mode == "mock";
+    assert first_run.requirement_count == 5;
+    assert first_run.compile_status == "PASSED";
+    assert first_run.smoke_status == "PASSED";
+    assert first_run.regression_status == "VERIFICATION_FAILED";
+    assert first_run.reverify_status == "PASSED";
+    assert first_run.failure_kind == "WRAP_MISMATCH";
+    assert first_run.failure_expected == "55";
+    assert first_run.failure_observed == "33";
+    assert "Write pointer wraps to 1" in first_run.top_hypothesis;
+    assert first_run.candidate_applied;
+    assert first_run.tool_evidence_available;
+    assert "WRAP_MISMATCH" in first_run.regression_output;
+    assert "WRAP_TEST_PASS" in first_run.reverify_output;
+
+    expected_walkers = [
+        "LoadInputsWalker",
+        "CompileWalker",
+        "SimulateWalker",
+        "StructureFailureWalker",
+        "RankHypothesesWalker",
+        "GenerateArtifactWalker",
+        "ReverifyAndRenderWalker"
+    ];
+    assert first_run.walker_log == expected_walkers;
+
+    walker_names = [
+        transition.walker_name
+        for transition in first_run.transitions
+    ];
+    for name in expected_walkers {
+        assert name in walker_names;
+    }
+
+    runs: list[Run] = [root -->[?:Run, run_id == first_run.job_id]];
+    assert len(runs) == 1;
+    run = runs[0];
+    assert len([run ->:OwnsRequirement:->]) == 5;
+    assert len([run ->:OwnsModule:->]) == 1;
+    assert len([run ->:Executes:->]) == 2;
+    assert len([run ->:FailedWith:->]) == 1;
+    failure = [run ->:FailedWith:->][0];
+    hyps = [failure ->:Motivates:->];
+    assert len(hyps) >= 1;
+    arts = [hyps[0] ->:Produces:->];
+    assert len(arts) == 1;
+    assert len([arts[0] ->:ReverifiedBy:->]) == 1;
+}
+
+test "dashboard endpoint still returns project recommendations" {
+    dashboard = get_dashboard();
     assert dashboard.failure_events == 18;
     assert dashboard.root_cause_clusters == 3;
     assert len(dashboard.recommendations) == 3;
-    assert len(first_run.transitions) == 10;
-    assert len(second_run.transitions) == 10;
-    assert second_run.current_state == "DONE";
-    assert first_run.tool_evidence_available;
-    assert first_run.requirement_count == 5;
-    assert "WRAP_MISMATCH" in first_run.regression_output;
-    assert "WRAP_TEST_PASS" in first_run.reverify_output;
 }

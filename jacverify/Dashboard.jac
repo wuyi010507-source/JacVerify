@@ -28,10 +28,24 @@ def:pub EvidenceBadge(evidence_kind: str) -> JsxElement {
     return <span className={badge_class}>{label}</span>;
 }
 
+def:pub StatusLabel(status: str) -> JsxElement {
+    label = status;
+    if status == "VERIFICATION_FAILED" {
+        label = "VERIFICATION FAILED";
+    } elif status == "TOOL_ERROR" {
+        label = "TOOL ERROR";
+    } elif status == "BUG_NOT_REPRODUCED" {
+        label = "BUG NOT REPRODUCED";
+    } elif status == "PASSED" {
+        label = "PASSED";
+    }
+    return <span className={"status-pill " + status.lower()}>{label}</span>;
+}
+
 def:pub Dashboard -> JsxElement {
     has dashboard: DashboardData | None = None,
         demo_run: DemoRunResult | None = None,
-        active_view: str = "project",
+        active_view: str = "task",
         loading: bool = True,
         running: bool = False,
         error_message: str = "";
@@ -188,31 +202,31 @@ def:pub Dashboard -> JsxElement {
                 <section className="view-stack">
                     <div className="task-hero">
                         <div>
-                            <div className="eyebrow">TASK EXECUTION LAYER</div>
+                            <div className="eyebrow">SEVEN-WALKER EVIDENCE PIPELINE</div>
                             <h2>FIFO wraparound verification</h2>
                             <p>
-                                One guarded Jac Walker follows evidence through the FSM.
-                                High-risk RTL changes remain behind a human gate.
+                                Seven Jac walkers load inputs, compile, simulate, structure failure,
+                                rank hypotheses, generate a reviewed candidate, and reverify.
                             </p>
                         </div>
                         <button className="run-button" onClick={run_demo} disabled={running}>
-                            {"Running Jac Walker…" if running else "Run evidence loop"}
+                            {"Running walkers…" if running else "Run seven-walker loop"}
                         </button>
                     </div>
 
                     {if demo_run is None {
                         <div className="empty-demo">
                             <div className="empty-icon">▶</div>
-                            <h3>Ready to run the core workflow live</h3>
+                            <h3>Ready to run the walker pipeline</h3>
                             <p>
-                                The demo will ingest requirements, record a regression failure,
-                                rank a hypothesis, choose a bounded action and reverify it.
+                                Set JACVERIFY_MOCK_TOOLS=1 and JACVERIFY_MOCK_LLM=1 for a fully
+                                mocked end-to-end run without Icarus or an API key.
                             </p>
                         </div>
                     } else {
                         <div className="run-summary">
                             <div>
-                                <span>JOB</span>
+                                <span>RUN</span>
                                 <strong>{demo_run.job_id}</strong>
                             </div>
                             <div>
@@ -220,40 +234,107 @@ def:pub Dashboard -> JsxElement {
                                 <strong className="done-state">{demo_run.current_state}</strong>
                             </div>
                             <div>
-                                <span>TRANSITIONS</span>
-                                <strong>{len(demo_run.transitions)}</strong>
+                                <span>TOOL MODE</span>
+                                <strong>{demo_run.tool_mode}</strong>
                             </div>
                             <div>
-                                <span>STATUS</span>
-                                <strong>{demo_run.status}</strong>
+                                <span>LLM MODE</span>
+                                <strong>{demo_run.llm_mode}</strong>
                             </div>
+                        </div>
+
+                        <div className="mode-row">
+                            <span>Walkers: {demo_run.walker_log}</span>
+                            <a className="repo-link" href={demo_run.graph_hint} target="_blank">
+                                Inspect evidence graph ↗
+                            </a>
+                        </div>
+
+                        <div className="evidence-panel">
+                            <div className="evidence-grid">
+                                <div>
+                                    <span>Compile</span>
+                                    <StatusLabel status={demo_run.compile_status} />
+                                </div>
+                                <div>
+                                    <span>Smoke</span>
+                                    <StatusLabel status={demo_run.smoke_status} />
+                                </div>
+                                <div>
+                                    <span>Regression</span>
+                                    <StatusLabel status={demo_run.regression_status} />
+                                </div>
+                                <div>
+                                    <span>Re-verify</span>
+                                    <StatusLabel
+                                        status={
+                                            "PASSED"
+                                            if demo_run.reverify_status == "PASSED"
+                                            else demo_run.reverify_status
+                                        }
+                                    />
+                                    {if demo_run.reverify_status == "PASSED" {
+                                        <small>RE-VERIFICATION PASSED</small>
+                                    }}
+                                </div>
+                            </div>
+                            {if demo_run.failure_kind {
+                                <div className="failure-box">
+                                    <strong>{demo_run.failure_kind}</strong>
+                                    <div>expected={demo_run.failure_expected}</div>
+                                    <div>observed={demo_run.failure_observed}</div>
+                                    {if demo_run.failure_cycle {
+                                        <div>cycle={demo_run.failure_cycle}</div>
+                                    }}
+                                </div>
+                            }}
+                            {if demo_run.top_hypothesis {
+                                <div className="hypothesis-box">
+                                    <div className="eyebrow">TOP HYPOTHESIS</div>
+                                    <p>{demo_run.top_hypothesis}</p>
+                                    <small>confidence={str(demo_run.top_confidence)[:4]} · model inference, not proof</small>
+                                </div>
+                            }}
+                            {if demo_run.artifact_description {
+                                <div className="artifact-box">
+                                    <div className="eyebrow">ARTIFACT / REVIEWED CANDIDATE</div>
+                                    <p>{demo_run.artifact_description}</p>
+                                    <small>
+                                        {
+                                            "candidate applied: " + demo_run.candidate_label
+                                            if demo_run.candidate_applied
+                                            else "candidate not applied"
+                                        }
+                                    </small>
+                                </div>
+                            }}
+                            {if demo_run.stop_reason {
+                                <div className="error-banner">{demo_run.stop_reason}</div>
+                            }}
                         </div>
 
                         <div className="tool-proof">
                             <div className="tool-proof-heading">
                                 <div>
-                                    <div className="eyebrow">EXECUTABLE TOOL EVIDENCE</div>
+                                    <div className="eyebrow">TOOL EVIDENCE</div>
                                     <h3>{demo_run.toolchain}</h3>
                                     <p className="proof-subline">
-                                        {demo_run.requirement_count} requirements loaded from fifo_spec.md
+                                        {demo_run.requirement_count} requirements · status {demo_run.status}
                                     </p>
                                 </div>
                                 <span className={"proof-status ready" if demo_run.tool_evidence_available else "proof-status blocked"}>
-                                    {"REAL RUN VERIFIED" if demo_run.tool_evidence_available else "TOOL RUN BLOCKED"}
+                                    {"PIPELINE COMPLETE" if demo_run.tool_evidence_available else "PIPELINE INCOMPLETE"}
                                 </span>
                             </div>
                             <div className="terminal-grid">
                                 <div className="terminal">
-                                    <div className="terminal-label failure-output">BUGGY RTL · EXPECTED FAILURE</div>
+                                    <div className="terminal-label failure-output">BUGGY RTL · VERIFICATION FAILED</div>
                                     <pre>{demo_run.regression_output}</pre>
                                 </div>
                                 <div className="terminal">
-                                    <div className="terminal-label pass-output">PATCH FIXTURE · REVERIFY PASS</div>
+                                    <div className="terminal-label pass-output">REVIEWED FIXTURE · RE-VERIFICATION</div>
                                     <pre>{demo_run.reverify_output}</pre>
                                 </div>
-                            </div>
-                            <div className="manifest-path">
-                                Artifact manifest: {demo_run.artifact_manifest}
                             </div>
                         </div>
 
@@ -267,6 +348,9 @@ def:pub Dashboard -> JsxElement {
                                             <span className="arrow">→</span>
                                             <strong>{transition.to_state}</strong>
                                             <EvidenceBadge evidence_kind={transition.evidence_kind} />
+                                            {if transition.walker_name {
+                                                <span className="evidence-chip">{transition.walker_name}</span>
+                                            }}
                                         </div>
                                         <h3>{transition.event}</h3>
                                         <p>{transition.summary}</p>

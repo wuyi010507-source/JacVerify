@@ -587,6 +587,86 @@ h1 {
   word-break: break-all;
 }
 
+.mode-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  color: #8aa0b3;
+  font: 11px/1.5 "DM Mono", monospace;
+  margin: 8px 0 18px;
+  flex-wrap: wrap;
+}
+
+.evidence-panel {
+  border: 1px solid var(--line);
+  padding: 16px;
+  margin-bottom: 18px;
+  display: grid;
+  gap: 14px;
+}
+
+.evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.evidence-grid > div {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: #9eb2c3;
+}
+
+.status-pill {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid #3a5770;
+  padding: 4px 8px;
+  font: 10px/1 "DM Mono", monospace;
+  letter-spacing: 0.04em;
+}
+
+.status-pill.passed {
+  color: var(--green);
+  border-color: rgba(92, 214, 158, 0.55);
+}
+
+.status-pill.verification_failed {
+  color: var(--red);
+  border-color: rgba(255, 111, 125, 0.55);
+}
+
+.status-pill.tool_error,
+.status-pill.bug_not_reproduced,
+.status-pill.not_run,
+.status-pill.blocked {
+  color: #f0c674;
+  border-color: rgba(240, 198, 116, 0.5);
+}
+
+.failure-box,
+.hypothesis-box,
+.artifact-box {
+  border-left: 2px solid #3a5770;
+  padding-left: 12px;
+  display: grid;
+  gap: 4px;
+}
+
+.failure-box {
+  border-left-color: var(--red);
+}
+
+.hypothesis-box {
+  border-left-color: #7eb6ff;
+}
+
+.artifact-box {
+  border-left-color: var(--green);
+}
+
 .timeline {
   display: grid;
   gap: 0;

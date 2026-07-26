@@ -2,89 +2,91 @@
 
 Graph-native, evidence-driven chip verification orchestrator built with Jac and open-source EDA tools.
 
-JacVerify is an evidence-driven verification decision layer for chip verification teams. It answers two connected questions:
+The P0 demo is a seven-walker FIFO wraparound pipeline:
 
-1. **Project view:** Which verification action is most valuable next, given risk, evidence, urgency, and compute cost?
-2. **Task view:** How can that action move through an observable, recoverable, and auditable verification loop?
+```text
+LoadInputsWalker
+→ CompileWalker
+→ SimulateWalker
+→ StructureFailureWalker
+→ RankHypothesesWalker
+→ GenerateArtifactWalker
+→ ReverifyAndRenderWalker
+```
 
-Jac is the center of the system—not a wrapper. Jac nodes and edges store project and verification state; `ProjectPlanner` traverses the graph to rank actions; `StateExecutor` drives the FIFO verification FSM; typed Jac endpoints connect the graph to a Jac client UI.
+## Modes
 
-## Live demo story
+| Variable | `1` | `0` / unset |
+|---|---|---|
+| `JACVERIFY_MOCK_TOOLS` | Deterministic mock tool adapters | Live Icarus Verilog (`iverilog` / `vvp`) |
+| `JACVERIFY_MOCK_LLM` | Deterministic mock diagnosis / artifact | Live LLM (not configured in this build; set to `1`) |
 
-The demo starts with three candidate actions:
+Mock adapters replace tool/LLM backends. They do **not** bypass walkers, graph updates, or transition logging.
 
-- **Module A · FIFO:** a high-confidence wraparound failure cluster with low reverify cost.
-- **Module B · Coverage:** broad random regression is producing little marginal coverage.
-- **Module C · Environment:** failures match a configuration signature, so changing RTL would be unsupported.
+There is **no silent fallback** from live tools to mock when a simulator is missing. Live mode returns `TOOL_ERROR` and the pipeline stops.
 
-JacVerify ranks Module A first. The operator then runs an executable FIFO evidence loop:
-
-1. Load five requirements from `demo/fifo/fifo_spec.md`.
-2. Compile and smoke-test the buggy RTL with Icarus Verilog.
-3. Reproduce a real `WRAP_MISMATCH`.
-4. Record a model-inference step and a bounded action recommendation.
-5. Run the same directed test against a pre-approved patch fixture.
-6. Record a real `WRAP_TEST_PASS` and complete the FSM.
-
-The UI labels **tool facts**, **model inferences**, **action recommendations**, and **scenario data** separately.
-
-## Run locally
-
-Prerequisites:
-
-- Jac 0.34.7
-- Icarus Verilog 13+
-
-On macOS:
+## Fully mocked mode (no simulator, no API key)
 
 ```bash
-brew install icarus-verilog
 jac install
+
+JACVERIFY_MOCK_TOOLS=1 \
+JACVERIFY_MOCK_LLM=1 \
 jac start --dev main.jac
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
+Open [http://localhost:8000](http://localhost:8000), stay on **FIFO evidence loop**, click **Run seven-walker loop**.
+
+Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
+
+## Live simulator with deterministic LLM
+
+Requires Icarus Verilog 13+:
+
+```bash
+brew install icarus-verilog
+
+JACVERIFY_MOCK_TOOLS=0 \
+JACVERIFY_MOCK_LLM=1 \
+jac start --dev main.jac
+```
+
+Current simulator integration: **Icarus Verilog** (`iverilog` + `vvp`), not Verilator/cocotb.
 
 ## Verify
 
 ```bash
-JAC_DATA_PATH="$(mktemp -d)" jac test jacverify/store.jac -v
+JACVERIFY_MOCK_TOOLS=1 \
+JACVERIFY_MOCK_LLM=1 \
+JAC_DATA_PATH="$(mktemp -d)" \
+jac test jacverify/store.jac -v
+
+JACVERIFY_MOCK_TOOLS=1 \
+JACVERIFY_MOCK_LLM=1 \
 .jac/venv/bin/python -m pytest tests/test_tool_adapter.py -q
-JAC_DATA_PATH="$(mktemp -d)" jac check .
 ```
 
-The temporary `JAC_DATA_PATH` keeps test state separate from the live demo graph. With
-Jac 0.34.7 microservice mode, do not run `jac clean --data` against a stopped or
-running demo and then reuse its service user database: the stale guest-root record can
-point at a deleted graph anchor. Avoid `jac clean --all` immediately before Python
-tests because it removes `.jac/venv`.
+## What is live vs mocked
+
+- **Always Jac-orchestrated:** seven walkers, graph nodes/edges, transition records.
+- **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise real Icarus compile/sim/reverify.
+- **LLM:** deterministic ranked hypotheses + reviewed-candidate artifact description when `JACVERIFY_MOCK_LLM=1`.
+- **Fixed RTL:** `demo/fifo/fifo_fixed.sv` is a **pre-reviewed candidate fixture**, not an LLM-authored patch. Re-verification PASS comes only from the simulator `ToolResult`.
 
 ## Architecture
 
 ```text
-Jac client
-  → typed Jac endpoints
-    → ProjectPlanner walker
-      → project/action graph
-    → StateExecutor walker
-      → verification job/transition graph
-        → allow-listed Python tool adapter
-          → Icarus Verilog
-          → immutable run artifacts
+Dashboard / run_fifo_demo
+  → create fresh Run
+  → LoadInputsWalker … ReverifyAndRenderWalker
+      → ToolResult adapters (mock or Icarus)
+      → typed LLM wrappers (mock)
+      → Requirement / Module / Test / Run / Failure / Hypothesis / Artifact graph
 ```
 
 Important entrypoints:
 
-- `main.jac` — full-stack entry.
-- `jacverify/store.jac` — graph schema, scoring policy, walkers, FSM, endpoints.
-- `jacverify/Dashboard.jac` — project and task views.
-- `jacverify/tool_adapter.py` — deterministic, allow-listed EDA adapter.
-- `demo/fifo/` — specification, buggy/fixed RTL, smoke and wraparound testbenches.
-- `runs/fifo-demo/tool_evidence.json` — generated evidence manifest.
-
-## Scope and honesty
-
-- Module A uses an executable local Icarus Verilog flow.
-- Modules B/C, project budget, milestone, and aggregate failure counts are demo scenario inputs.
-- The fixed RTL is a pre-approved patch fixture, not an autonomous production code change.
-- The LLM/model layer never declares verification success; pass/fail states come from deterministic tools and Jac guards.
+- `main.jac` — full-stack entry
+- `jacverify/store.jac` — graph model, seven walkers, endpoints
+- `jacverify/tool_adapter.py` — shared `ToolResult` + mock/live adapters
+- `demo/fifo/` — buggy/fixed RTL, smoke + wrap testbenches, five requirements

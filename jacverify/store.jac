@@ -1,7 +1,29 @@
-"""JacVerify graph model and deterministic decision policy."""
+"""JacVerify graph model, seven-walker FIFO pipeline, and dashboard endpoints."""
 
 import os;
-import from jacverify.tool_adapter { FifoSuiteEvidence, run_fifo_suite }
+import from jacverify.tool_adapter {
+    ArtifactDraft,
+    FailureEvidence,
+    HypothesisDraft,
+    SpecLoadResult,
+    ToolResult,
+    fresh_run_id,
+    generate_artifact,
+    lint_compile,
+    llm_mode,
+    load_spec,
+    make_hypothesis_draft,
+    parse_failure_from_stored,
+    rank_hypotheses,
+    run_reverify,
+    run_smoke,
+    run_wrap_regression,
+    tools_mode
+}
+
+# ---------------------------------------------------------------------------
+# Project-level demo graph (preserved for the optional priorities tab)
+# ---------------------------------------------------------------------------
 
 node Project {
     has project_id: str,
@@ -26,12 +48,108 @@ node ActionCandidate {
 
 edge HasAction: Project --> ActionCandidate {}
 
-node VerificationJob {
-    has job_id: str,
+# ---------------------------------------------------------------------------
+# Core verification evidence graph
+# ---------------------------------------------------------------------------
+
+node Requirement {
+    has req_id: str,
+        text: str,
+        run_id: str,
+        source_walker: str = "LoadInputsWalker";
+}
+
+node Module {
+    has module_name: str,
+        rtl_path: str,
+        run_id: str,
+        source_walker: str = "LoadInputsWalker";
+}
+
+node Test {
+    has test_id: str,
+        name: str,
+        kind: str,
+        run_id: str,
+        status: str = "NOT_RUN",
+        stdout: str = "",
+        source_walker: str = "";
+}
+
+node Run {
+    has run_id: str,
         title: str,
         current_state: str = "S0_SPEC_INGEST",
-        status: str = "running";
+        status: str = "running",
+        tool_mode: str = "mock",
+        llm_mode: str = "mock",
+        workspace_root: str = "",
+        output_dir: str = "",
+        stop_reason: str = "",
+        walker_log: list[str] = [],
+        requirement_count: int = 0,
+        module_name: str = "",
+        module_path: str = "",
+        compile_status: str = "NOT_RUN",
+        compile_stdout: str = "",
+        smoke_status: str = "NOT_RUN",
+        smoke_stdout: str = "",
+        regression_status: str = "NOT_RUN",
+        regression_stdout: str = "",
+        regression_tool: str = "",
+        regression_exit_code: int = -1,
+        failure_kind: str = "",
+        failure_expected: str = "",
+        failure_observed: str = "",
+        failure_cycle: str = "",
+        top_hypothesis: str = "",
+        top_confidence: float = 0.0,
+        artifact_description: str = "",
+        candidate_label: str = "",
+        candidate_path: str = "",
+        candidate_applied: bool = False,
+        reverify_status: str = "NOT_RUN",
+        reverify_stdout: str = "",
+        graph_hint: str = "/graph";
 }
+
+node Failure {
+    has kind: str,
+        expected: str,
+        observed: str,
+        raw_stdout: str,
+        run_id: str,
+        cycle: str = "",
+        source_walker: str = "StructureFailureWalker";
+}
+
+node Hypothesis {
+    has rank: int,
+        claim: str,
+        confidence: float,
+        next_action: str,
+        run_id: str,
+        source_walker: str = "RankHypothesesWalker";
+}
+
+node Artifact {
+    has kind: str,
+        description: str,
+        candidate_path: str,
+        candidate_label: str,
+        run_id: str,
+        source_walker: str = "GenerateArtifactWalker";
+}
+
+edge Verifies: Requirement --> Test {}
+edge Targets: Test --> Module {}
+edge Executes: Run --> Test {}
+edge FailedWith: Run --> Failure {}
+edge Motivates: Failure --> Hypothesis {}
+edge Produces: Hypothesis --> Artifact {}
+edge ReverifiedBy: Artifact --> Run {}
+edge OwnsModule: Run --> Module {}
+edge OwnsRequirement: Run --> Requirement {}
 
 node TransitionRecord {
     has sequence: int,
@@ -40,10 +158,25 @@ node TransitionRecord {
         event: str,
         summary: str,
         evidence_kind: str,
-        evidence_ids: list[str];
+        evidence_ids: list[str],
+        walker_name: str = "";
 }
 
-edge HasTransition: VerificationJob --> TransitionRecord {}
+edge HasTransition: Run --> TransitionRecord {}
+
+# Legacy job node retained for existing StateExecutor unit tests.
+node VerificationJob {
+    has job_id: str,
+        title: str,
+        current_state: str = "S0_SPEC_INGEST",
+        status: str = "running";
+}
+
+edge HasJobTransition: VerificationJob --> TransitionRecord {}
+
+# ---------------------------------------------------------------------------
+# DTOs
+# ---------------------------------------------------------------------------
 
 obj PriorityRecommendation {
     has rank: int,
@@ -74,7 +207,8 @@ obj TransitionView {
         event: str,
         summary: str,
         evidence_kind: str,
-        evidence_ids: list[str];
+        evidence_ids: list[str],
+        walker_name: str = "";
 }
 
 obj DashboardData {
@@ -98,8 +232,30 @@ obj DemoRunResult {
         toolchain: str,
         regression_output: str,
         reverify_output: str,
-        artifact_manifest: str;
+        artifact_manifest: str,
+        tool_mode: str = "mock",
+        llm_mode: str = "mock",
+        walker_log: list[str] = [],
+        compile_status: str = "NOT_RUN",
+        smoke_status: str = "NOT_RUN",
+        regression_status: str = "NOT_RUN",
+        reverify_status: str = "NOT_RUN",
+        failure_kind: str = "",
+        failure_expected: str = "",
+        failure_observed: str = "",
+        failure_cycle: str = "",
+        top_hypothesis: str = "",
+        top_confidence: float = 0.0,
+        artifact_description: str = "",
+        candidate_label: str = "",
+        candidate_applied: bool = False,
+        stop_reason: str = "",
+        graph_hint: str = "/graph";
 }
+
+# ---------------------------------------------------------------------------
+# Project scoring (preserved)
+# ---------------------------------------------------------------------------
 
 def score_action(candidate: ActionCandidate) -> float {
     if candidate.estimated_cost <= 0.0 {
@@ -235,6 +391,10 @@ def seed_demo_project(target_project_id: str) -> Project {
     return project;
 }
 
+# ---------------------------------------------------------------------------
+# Legacy FSM helpers (validation / unit tests only — not the demo story)
+# ---------------------------------------------------------------------------
+
 def create_fifo_job(target_job_id: str) -> VerificationJob {
     existing: list[VerificationJob] = [root -->[?:VerificationJob]];
     for job in existing {
@@ -348,9 +508,63 @@ def plan_transition(current_state: str) -> PlannedTransition {
     );
 }
 
-def list_job_transitions(job: VerificationJob) -> list[TransitionView] {
+# ---------------------------------------------------------------------------
+# Run helpers
+# ---------------------------------------------------------------------------
+
+def new_run_id() -> str {
+    return fresh_run_id("fifo-run");
+}
+
+def append_transition(
+    run: Run,
+    from_state: str,
+    to_state: str,
+    event: str,
+    summary: str,
+    evidence_kind: str,
+    evidence_ids: list[str],
+    walker_name: str
+) -> TransitionView {
+    sequence = len([run ->:HasTransition:->]) + 1;
+    run +>:HasTransition:+> TransitionRecord(
+        sequence=sequence,
+        from_state=from_state,
+        to_state=to_state,
+        event=event,
+        summary=summary,
+        evidence_kind=evidence_kind,
+        evidence_ids=evidence_ids,
+        walker_name=walker_name
+    );
+    run.current_state = to_state;
+    if not run.walker_log or run.walker_log[-1] != walker_name {
+        run.walker_log = run.walker_log + [walker_name];
+    }
+    return TransitionView(
+        sequence=sequence,
+        from_state=from_state,
+        to_state=to_state,
+        event=event,
+        summary=summary,
+        evidence_kind=evidence_kind,
+        evidence_ids=evidence_ids,
+        walker_name=walker_name
+    );
+}
+
+def block_run(run: Run, reason: str, walker_name: str) -> None {
+    run.status = "blocked";
+    run.stop_reason = reason;
+    run.current_state = "BLOCKED";
+    if walker_name not in run.walker_log {
+        run.walker_log = run.walker_log + [walker_name];
+    }
+}
+
+def list_run_transitions(run: Run) -> list[TransitionView] {
     records = sorted(
-        [job ->:HasTransition:->],
+        [run ->:HasTransition:->],
         key=lambda (record: TransitionRecord) {
             record.sequence;
         }
@@ -363,11 +577,712 @@ def list_job_transitions(job: VerificationJob) -> list[TransitionView] {
             event=record.event,
             summary=record.summary,
             evidence_kind=record.evidence_kind,
-            evidence_ids=record.evidence_ids
+            evidence_ids=record.evidence_ids,
+            walker_name=record.walker_name
         )
         for record in records
     ];
 }
+
+def build_demo_result(run: Run) -> DemoRunResult {
+    toolchain = (
+        "Icarus Verilog · mock adapters"
+        if run.tool_mode == "mock"
+        else "Icarus Verilog · live iverilog/vvp"
+    );
+    tool_ok = (
+        run.status == "complete"
+        and run.compile_status == "PASSED"
+        and run.smoke_status == "PASSED"
+        and run.regression_status == "VERIFICATION_FAILED"
+        and run.reverify_status == "PASSED"
+        and run.candidate_applied
+    );
+    return DemoRunResult(
+        job_id=run.run_id,
+        current_state=run.current_state,
+        status=run.status,
+        transitions=list_run_transitions(run),
+        tool_evidence_available=tool_ok,
+        requirement_count=run.requirement_count,
+        toolchain=toolchain,
+        regression_output=run.regression_stdout.strip(),
+        reverify_output=run.reverify_stdout.strip(),
+        artifact_manifest=os.path.join(run.output_dir, "tool_evidence.json"),
+        tool_mode=run.tool_mode,
+        llm_mode=run.llm_mode,
+        walker_log=run.walker_log,
+        compile_status=run.compile_status,
+        smoke_status=run.smoke_status,
+        regression_status=run.regression_status,
+        reverify_status=run.reverify_status,
+        failure_kind=run.failure_kind,
+        failure_expected=run.failure_expected,
+        failure_observed=run.failure_observed,
+        failure_cycle=run.failure_cycle,
+        top_hypothesis=run.top_hypothesis,
+        top_confidence=run.top_confidence,
+        artifact_description=run.artifact_description,
+        candidate_label=run.candidate_label,
+        candidate_applied=run.candidate_applied,
+        stop_reason=run.stop_reason,
+        graph_hint=run.graph_hint
+    );
+}
+
+# ---------------------------------------------------------------------------
+# Constrained LLM wrappers (typed interface; mock by default)
+# ---------------------------------------------------------------------------
+
+# Rank diagnostic hypotheses only. Never declares design PASS/FAIL.
+def rank_hypotheses_for_run(failure: FailureEvidence) -> list[HypothesisDraft] {
+    return rank_hypotheses(failure);
+}
+
+# Draft a reviewed candidate description. Never declares design PASS.
+def generate_artifact_for_run(
+    hypothesis: HypothesisDraft,
+    module_name: str
+) -> ArtifactDraft {
+    return generate_artifact(hypothesis, module_name);
+}
+
+# ---------------------------------------------------------------------------
+# Seven walkers
+# ---------------------------------------------------------------------------
+
+walker LoadInputsWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can load_inputs with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "S0_SPEC_INGEST" {
+            block_run(here, "LoadInputsWalker expected S0_SPEC_INGEST", "LoadInputsWalker");
+            skip;
+        }
+        try {
+            spec: SpecLoadResult = load_spec(here.workspace_root);
+            here.requirement_count = spec.requirement_count;
+            here.module_name = spec.module_name;
+            here.module_path = spec.module_path;
+            module_node = here +>:OwnsModule:+> Module(
+                module_name=spec.module_name,
+                rtl_path=spec.module_path,
+                run_id=here.run_id,
+                source_walker="LoadInputsWalker"
+            );
+            for req in spec.requirements {
+                here +>:OwnsRequirement:+> Requirement(
+                    req_id=req.req_id,
+                    text=req.text,
+                    run_id=here.run_id,
+                    source_walker="LoadInputsWalker"
+                );
+            }
+            append_transition(
+                here,
+                "S0_SPEC_INGEST",
+                "S3_STATIC_CHECK",
+                "spec_and_design_loaded",
+                f"Loaded {spec.requirement_count} requirements and module {spec.module_name}.",
+                "tool_fact",
+                [spec.spec_path, spec.module_path],
+                "LoadInputsWalker"
+            );
+        } except Exception as exc {
+            block_run(here, "LoadInputsWalker failed: " + str(exc), "LoadInputsWalker");
+            append_transition(
+                here,
+                "S0_SPEC_INGEST",
+                "BLOCKED",
+                "load_inputs_failed",
+                str(exc),
+                "tool_fact",
+                ["error:load_inputs"],
+                "LoadInputsWalker"
+            );
+        }
+    }
+}
+
+walker CompileWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can compile with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "S3_STATIC_CHECK" {
+            block_run(here, "CompileWalker missing loaded inputs", "CompileWalker");
+            skip;
+        }
+        if here.requirement_count <= 0 or not here.module_path {
+            block_run(here, "CompileWalker refused: inputs missing", "CompileWalker");
+            skip;
+        }
+        result: ToolResult = lint_compile(here.workspace_root, here.output_dir);
+        here.compile_status = result.status;
+        here.compile_stdout = result.stdout;
+        if result.status == "PASSED" {
+            append_transition(
+                here,
+                "S3_STATIC_CHECK",
+                "S4_COMPILE_ELAB",
+                "lint_compile_passed",
+                f"Compile/lint {result.status} via {result.tool} ({result.mode}).",
+                "tool_fact",
+                [f"tool:{result.tool}", f"status:{result.status}"],
+                "CompileWalker"
+            );
+        } else {
+            block_run(
+                here,
+                f"TOOL_ERROR during compile: {result.stderr or result.stdout}",
+                "CompileWalker"
+            );
+            append_transition(
+                here,
+                "S3_STATIC_CHECK",
+                "BLOCKED",
+                "lint_compile_tool_error",
+                f"Compile stopped with {result.status}.",
+                "tool_fact",
+                [f"status:{result.status}"],
+                "CompileWalker"
+            );
+        }
+    }
+}
+
+walker SimulateWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can simulate with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "S4_COMPILE_ELAB" {
+            block_run(here, "SimulateWalker refused: compile stage incomplete", "SimulateWalker");
+            skip;
+        }
+        if here.compile_status != "PASSED" {
+            block_run(here, "SimulateWalker refused: compile not PASSED", "SimulateWalker");
+            skip;
+        }
+
+        modules: list[Module] = [here ->:OwnsModule:->];
+        if not modules {
+            block_run(here, "SimulateWalker refused: Module node missing", "SimulateWalker");
+            skip;
+        }
+        module_node = modules[0];
+
+        smoke: ToolResult = run_smoke(here.workspace_root, here.output_dir);
+        here.smoke_status = smoke.status;
+        here.smoke_stdout = smoke.stdout;
+        smoke_test = here +>:Executes:+> Test(
+            test_id=here.run_id + ":smoke",
+            name="tb_smoke",
+            kind="smoke",
+            status=smoke.status,
+            stdout=smoke.stdout,
+            run_id=here.run_id,
+            source_walker="SimulateWalker"
+        );
+        smoke_test +>:Targets:+> module_node;
+        for req in [here ->:OwnsRequirement:->] {
+            if "ORDER" in req.req_id or "RESET" in req.req_id {
+                req +>:Verifies:+> smoke_test;
+            }
+        }
+
+        if smoke.status != "PASSED" {
+            block_run(
+                here,
+                f"Smoke did not pass ({smoke.status})",
+                "SimulateWalker"
+            );
+            append_transition(
+                here,
+                "S4_COMPILE_ELAB",
+                "BLOCKED",
+                "smoke_failed",
+                f"Smoke result {smoke.status}.",
+                "tool_fact",
+                [f"status:{smoke.status}"],
+                "SimulateWalker"
+            );
+            skip;
+        }
+
+        regression: ToolResult = run_wrap_regression(here.workspace_root, here.output_dir);
+        here.regression_status = regression.status;
+        here.regression_stdout = regression.stdout;
+        here.regression_tool = regression.tool;
+        if regression.exit_code is not None {
+            here.regression_exit_code = regression.exit_code;
+        } else {
+            here.regression_exit_code = -1;
+        }
+        wrap_test = here +>:Executes:+> Test(
+            test_id=here.run_id + ":wrap",
+            name="tb_wrap",
+            kind="wraparound",
+            status=regression.status,
+            stdout=regression.stdout,
+            run_id=here.run_id,
+            source_walker="SimulateWalker"
+        );
+        wrap_test +>:Targets:+> module_node;
+        for req in [here ->:OwnsRequirement:->] {
+            if "ORDER" in req.req_id or "FULL" in req.req_id {
+                req +>:Verifies:+> wrap_test;
+            }
+        }
+
+        if regression.status == "VERIFICATION_FAILED" {
+            append_transition(
+                here,
+                "S4_COMPILE_ELAB",
+                "S6_REGRESSION",
+                "wraparound_verification_failed",
+                "Wraparound regression reported VERIFICATION_FAILED (defect discovery).",
+                "tool_fact",
+                [f"status:{regression.status}", "test:tb_wrap"],
+                "SimulateWalker"
+            );
+            append_transition(
+                here,
+                "S6_REGRESSION",
+                "D0_FAILURE_NORMALIZE",
+                "ready_to_structure_failure",
+                "Defect evidence available for structuring.",
+                "tool_fact",
+                ["test:tb_wrap"],
+                "SimulateWalker"
+            );
+        } elif regression.status == "BUG_NOT_REPRODUCED" {
+            block_run(here, "BUG_NOT_REPRODUCED: buggy RTL unexpectedly passed", "SimulateWalker");
+            append_transition(
+                here,
+                "S4_COMPILE_ELAB",
+                "BLOCKED",
+                "bug_not_reproduced",
+                "Buggy wraparound regression passed; refusing to invent failure evidence.",
+                "tool_fact",
+                [f"status:{regression.status}"],
+                "SimulateWalker"
+            );
+        } else {
+            block_run(
+                here,
+                f"TOOL_ERROR during regression: {regression.stderr or regression.stdout}",
+                "SimulateWalker"
+            );
+            append_transition(
+                here,
+                "S4_COMPILE_ELAB",
+                "BLOCKED",
+                "regression_tool_error",
+                f"Regression stopped with {regression.status}.",
+                "tool_fact",
+                [f"status:{regression.status}"],
+                "SimulateWalker"
+            );
+        }
+    }
+}
+
+walker StructureFailureWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can structure_failure with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "D0_FAILURE_NORMALIZE" {
+            block_run(here, "StructureFailureWalker refused: wrong state", "StructureFailureWalker");
+            skip;
+        }
+        if here.regression_status != "VERIFICATION_FAILED" {
+            block_run(
+                here,
+                "StructureFailureWalker refused: regression was not VERIFICATION_FAILED",
+                "StructureFailureWalker"
+            );
+            skip;
+        }
+        failure: FailureEvidence | None = parse_failure_from_stored(
+            tool=here.regression_tool if here.regression_tool else "vvp",
+            mode=here.tool_mode,
+            status=here.regression_status,
+            exit_code=here.regression_exit_code,
+            stdout=here.regression_stdout
+        );
+        if failure is None {
+            block_run(
+                here,
+                "TOOL_ERROR: WRAP_MISMATCH could not be parsed from regression stdout",
+                "StructureFailureWalker"
+            );
+            append_transition(
+                here,
+                "D0_FAILURE_NORMALIZE",
+                "BLOCKED",
+                "failure_parse_error",
+                "Parser could not extract expected/observed from regression output.",
+                "tool_fact",
+                ["error:parse_failure"],
+                "StructureFailureWalker"
+            );
+            skip;
+        }
+        here.failure_kind = failure.kind;
+        if failure.expected is not None {
+            here.failure_expected = failure.expected;
+        } else {
+            here.failure_expected = "";
+        }
+        if failure.observed is not None {
+            here.failure_observed = failure.observed;
+        } else {
+            here.failure_observed = "";
+        }
+        if failure.cycle is not None {
+            here.failure_cycle = str(failure.cycle);
+        } else {
+            here.failure_cycle = "";
+        }
+        here +>:FailedWith:+> Failure(
+            kind=failure.kind,
+            expected=here.failure_expected,
+            observed=here.failure_observed,
+            cycle=here.failure_cycle,
+            raw_stdout=failure.raw_stdout,
+            run_id=here.run_id,
+            source_walker="StructureFailureWalker"
+        );
+        append_transition(
+            here,
+            "D0_FAILURE_NORMALIZE",
+            "D1_HYPOTHESIS_RANK",
+            "failure_structured",
+            f"{failure.kind} expected={here.failure_expected} observed={here.failure_observed}",
+            "tool_fact",
+            [f"failure:{failure.kind}", f"expected:{here.failure_expected}", f"observed:{here.failure_observed}"],
+            "StructureFailureWalker"
+        );
+    }
+}
+
+walker RankHypothesesWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can rank with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "D1_HYPOTHESIS_RANK" {
+            block_run(here, "RankHypothesesWalker refused: wrong state", "RankHypothesesWalker");
+            skip;
+        }
+        failures: list[Failure] = [here ->:FailedWith:->];
+        if not failures {
+            block_run(here, "RankHypothesesWalker refused: Failure node missing", "RankHypothesesWalker");
+            skip;
+        }
+        failure_node = failures[0];
+        evidence: FailureEvidence | None = parse_failure_from_stored(
+            tool=here.regression_tool if here.regression_tool else "vvp",
+            mode=here.tool_mode,
+            status=here.regression_status,
+            exit_code=here.regression_exit_code,
+            stdout=here.regression_stdout
+        );
+        if evidence is None {
+            block_run(here, "RankHypothesesWalker refused: missing structured evidence", "RankHypothesesWalker");
+            skip;
+        }
+        try {
+            drafts: list[HypothesisDraft] = rank_hypotheses_for_run(evidence);
+            if not drafts {
+                block_run(here, "RankHypothesesWalker produced no hypotheses", "RankHypothesesWalker");
+                skip;
+            }
+            top = drafts[0];
+            here.top_hypothesis = top.claim;
+            here.top_confidence = top.confidence;
+            for draft in drafts {
+                failure_node +>:Motivates:+> Hypothesis(
+                    rank=draft.rank,
+                    claim=draft.claim,
+                    confidence=draft.confidence,
+                    next_action=draft.next_action,
+                    run_id=here.run_id,
+                    source_walker="RankHypothesesWalker"
+                );
+            }
+            append_transition(
+                here,
+                "D1_HYPOTHESIS_RANK",
+                "D2_SELECT_REMEDIATION",
+                "hypotheses_ranked",
+                f"Top hypothesis confidence={top.confidence}: {top.claim}",
+                "model_inference",
+                [f"hypothesis:rank-1", f"llm_mode:{here.llm_mode}"],
+                "RankHypothesesWalker"
+            );
+            append_transition(
+                here,
+                "D2_SELECT_REMEDIATION",
+                "D3_GENERATE_ARTIFACT",
+                "remediation_selected",
+                top.next_action,
+                "action_recommendation",
+                ["policy:reviewed-candidate-first"],
+                "RankHypothesesWalker"
+            );
+        } except Exception as exc {
+            block_run(here, "RankHypothesesWalker failed: " + str(exc), "RankHypothesesWalker");
+            append_transition(
+                here,
+                "D1_HYPOTHESIS_RANK",
+                "BLOCKED",
+                "hypothesis_rank_failed",
+                str(exc),
+                "model_inference",
+                ["error:llm"],
+                "RankHypothesesWalker"
+            );
+        }
+    }
+}
+
+walker GenerateArtifactWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can generate with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "D3_GENERATE_ARTIFACT" {
+            block_run(here, "GenerateArtifactWalker refused: wrong state", "GenerateArtifactWalker");
+            skip;
+        }
+        failures: list[Failure] = [here ->:FailedWith:->];
+        if not failures {
+            block_run(here, "GenerateArtifactWalker refused: Failure missing", "GenerateArtifactWalker");
+            skip;
+        }
+        hyps: list[Hypothesis] = [failures[0] ->:Motivates:->];
+        if not hyps {
+            block_run(here, "GenerateArtifactWalker refused: Hypothesis missing", "GenerateArtifactWalker");
+            skip;
+        }
+        ranked = sorted(
+            hyps,
+            key=lambda (item: Hypothesis) {
+                item.rank;
+            }
+        );
+        top = ranked[0];
+        draft_in = make_hypothesis_draft(
+            top.rank,
+            top.claim,
+            top.confidence,
+            top.next_action
+        );
+        module_name = "fifo";
+        if here.module_name {
+            module_name = here.module_name;
+        }
+        try {
+            artifact_draft: ArtifactDraft = generate_artifact_for_run(
+                draft_in,
+                module_name
+            );
+            here.artifact_description = artifact_draft.description;
+            here.candidate_label = artifact_draft.candidate_label;
+            here.candidate_path = artifact_draft.candidate_path;
+            top +>:Produces:+> Artifact(
+                kind=artifact_draft.kind,
+                description=artifact_draft.description,
+                candidate_path=artifact_draft.candidate_path,
+                candidate_label=artifact_draft.candidate_label,
+                run_id=here.run_id,
+                source_walker="GenerateArtifactWalker"
+            );
+            append_transition(
+                here,
+                "D3_GENERATE_ARTIFACT",
+                "D4_APPLY_CANDIDATE",
+                "artifact_generated",
+                artifact_draft.description,
+                "action_recommendation",
+                [artifact_draft.candidate_label, f"llm_mode:{here.llm_mode}"],
+                "GenerateArtifactWalker"
+            );
+        } except Exception as exc {
+            block_run(here, "GenerateArtifactWalker failed: " + str(exc), "GenerateArtifactWalker");
+            append_transition(
+                here,
+                "D3_GENERATE_ARTIFACT",
+                "BLOCKED",
+                "artifact_generation_failed",
+                str(exc),
+                "action_recommendation",
+                ["error:llm"],
+                "GenerateArtifactWalker"
+            );
+        }
+    }
+}
+
+walker ReverifyAndRenderWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can reverify_and_render with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "D4_APPLY_CANDIDATE" {
+            block_run(here, "ReverifyAndRenderWalker refused: wrong state", "ReverifyAndRenderWalker");
+            skip;
+        }
+        if not here.candidate_path {
+            block_run(here, "ReverifyAndRenderWalker refused: candidate missing", "ReverifyAndRenderWalker");
+            skip;
+        }
+        artifacts: list[Artifact] = [];
+        for failure in [here ->:FailedWith:->] {
+            for hyp in [failure ->:Motivates:->] {
+                for art in [hyp ->:Produces:->] {
+                    artifacts.append(art);
+                }
+            }
+        }
+        if not artifacts {
+            block_run(here, "ReverifyAndRenderWalker refused: Artifact node missing", "ReverifyAndRenderWalker");
+            skip;
+        }
+        artifact_node = artifacts[0];
+
+        # Explicit reviewed-candidate application event (fixture, not auto RTL rewrite).
+        here.candidate_applied = True;
+        append_transition(
+            here,
+            "D4_APPLY_CANDIDATE",
+            "D5_TARGETED_REVERIFY",
+            "reviewed_candidate_applied",
+            f"Applied reviewed candidate fixture {here.candidate_label}.",
+            "action_recommendation",
+            [here.candidate_label, here.candidate_path],
+            "ReverifyAndRenderWalker"
+        );
+
+        result: ToolResult = run_reverify(here.workspace_root, here.output_dir);
+        here.reverify_status = result.status;
+        here.reverify_stdout = result.stdout;
+        reverify_run_id = here.run_id + ":reverify";
+        reverify_state = "BLOCKED";
+        reverify_status = "blocked";
+        if result.status == "PASSED" {
+            reverify_state = "DONE";
+            reverify_status = "complete";
+        }
+        reverify_run = root ++> Run(
+            run_id=reverify_run_id,
+            title="FIFO wraparound re-verification",
+            current_state=reverify_state,
+            status=reverify_status,
+            tool_mode=here.tool_mode,
+            llm_mode=here.llm_mode,
+            workspace_root=here.workspace_root,
+            output_dir=here.output_dir,
+            reverify_status=result.status,
+            reverify_stdout=result.stdout,
+            candidate_applied=True,
+            candidate_label=here.candidate_label,
+            candidate_path=here.candidate_path
+        );
+        artifact_node +>:ReverifiedBy:+> reverify_run;
+
+        if result.status == "PASSED" {
+            append_transition(
+                here,
+                "D5_TARGETED_REVERIFY",
+                "S9_SIGNOFF_GATE",
+                "reverification_passed",
+                "Re-verification PASSED against reviewed candidate fixture.",
+                "tool_fact",
+                [f"status:{result.status}", f"reverify_run:{reverify_run_id}"],
+                "ReverifyAndRenderWalker"
+            );
+            append_transition(
+                here,
+                "S9_SIGNOFF_GATE",
+                "DONE",
+                "evidence_trace_complete",
+                "Requirement-to-evidence graph ready for inspection at /graph.",
+                "tool_fact",
+                ["graph:/graph", f"run:{here.run_id}"],
+                "ReverifyAndRenderWalker"
+            );
+            here.status = "complete";
+            here.current_state = "DONE";
+        } else {
+            block_run(
+                here,
+                f"Re-verification did not pass ({result.status})",
+                "ReverifyAndRenderWalker"
+            );
+            append_transition(
+                here,
+                "D5_TARGETED_REVERIFY",
+                "BLOCKED",
+                "reverification_failed",
+                f"Re-verification returned {result.status}; refusing DONE.",
+                "tool_fact",
+                [f"status:{result.status}"],
+                "ReverifyAndRenderWalker"
+            );
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Legacy walkers preserved for unit tests
+# ---------------------------------------------------------------------------
 
 walker ProjectPlanner {
     has project_id: str,
@@ -413,16 +1328,18 @@ walker StateExecutor {
             event=plan.event,
             summary=plan.summary,
             evidence_kind=plan.evidence_kind,
-            evidence_ids=plan.evidence_ids
+            evidence_ids=plan.evidence_ids,
+            walker_name="StateExecutor"
         );
-        here +>:HasTransition:+> TransitionRecord(
+        here +>:HasJobTransition:+> TransitionRecord(
             sequence=view.sequence,
             from_state=view.from_state,
             to_state=view.to_state,
             event=view.event,
             summary=view.summary,
             evidence_kind=view.evidence_kind,
-            evidence_ids=view.evidence_ids
+            evidence_ids=view.evidence_ids,
+            walker_name="StateExecutor"
         );
         here.current_state = plan.to_state;
         if plan.to_state == "DONE" {
@@ -438,6 +1355,10 @@ walker StateExecutor {
         report self.transitions;
     }
 }
+
+# ---------------------------------------------------------------------------
+# Public endpoints
+# ---------------------------------------------------------------------------
 
 def:pub get_dashboard -> DashboardData {
     project = seed_demo_project("jacverify-demo");
@@ -462,37 +1383,41 @@ def:pub get_dashboard -> DashboardData {
     );
 }
 
+# Minimal orchestrator: creates a fresh Run, then invokes seven walkers.
 def:pub run_fifo_demo -> DemoRunResult {
     workspace_root = os.getcwd();
     output_dir = os.path.join(workspace_root, "runs", "fifo-demo");
-    evidence: FifoSuiteEvidence = run_fifo_suite(
-        workspace_root,
-        output_dir
+    run_id = new_run_id();
+    run = root ++> Run(
+        run_id=run_id,
+        title="FIFO wraparound verification",
+        current_state="S0_SPEC_INGEST",
+        status="running",
+        tool_mode=tools_mode(),
+        llm_mode=llm_mode(),
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+        graph_hint="/graph"
     );
-    tool_evidence_available = (
-        evidence.spec_requirement_count == 5
-        and evidence.lint.status == "passed"
-        and evidence.smoke.status == "passed"
-        and evidence.failing_regression.status == "failed"
-        and evidence.patched_reverify.status == "passed"
-    );
-    job = create_fifo_job("fifo-wrap-demo");
-    runner = root spawn StateExecutor(job_id=job.job_id);
-    transitions = (
-        runner.reports[0]
-        if runner.reports and runner.reports[0]
-        else list_job_transitions(job)
-    );
-    return DemoRunResult(
-        job_id=job.job_id,
-        current_state=job.current_state,
-        status=job.status,
-        transitions=transitions,
-        tool_evidence_available=tool_evidence_available,
-        requirement_count=evidence.spec_requirement_count,
-        toolchain="Icarus Verilog · allow-listed adapter",
-        regression_output=evidence.failing_regression.stdout.strip(),
-        reverify_output=evidence.patched_reverify.stdout.strip(),
-        artifact_manifest=os.path.join(output_dir, "tool_evidence.json")
-    );
+
+    root spawn LoadInputsWalker(run_id=run_id);
+    if run.status == "running" {
+        root spawn CompileWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn SimulateWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn StructureFailureWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn RankHypothesesWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn GenerateArtifactWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn ReverifyAndRenderWalker(run_id=run_id);
+    }
+    return build_demo_result(run);
 }
