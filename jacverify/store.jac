@@ -7,12 +7,16 @@ import from jacverify.tool_adapter {
     HypothesisDraft,
     SpecLoadResult,
     ToolResult,
+    UploadMatch,
     fresh_run_id,
     generate_artifact,
+    identify_uploaded_case,
     lint_compile,
     llm_mode,
+    load_curated_case_upload,
     load_spec,
     make_hypothesis_draft,
+    read_text_file,
     parse_failure_from_stored,
     rank_hypotheses,
     run_reverify,
@@ -110,7 +114,10 @@ node Run {
         candidate_applied: bool = False,
         reverify_status: str = "NOT_RUN",
         reverify_stdout: str = "",
-        graph_hint: str = "/graph";
+        graph_hint: str = "/graph",
+        case_id: str = "",
+        case_title: str = "",
+        uploaded_filename: str = "";
 }
 
 node Failure {
@@ -250,7 +257,20 @@ obj DemoRunResult {
         candidate_label: str = "",
         candidate_applied: bool = False,
         stop_reason: str = "",
-        graph_hint: str = "/graph";
+        graph_hint: str = "/graph",
+        case_id: str = "",
+        case_title: str = "",
+        uploaded_filename: str = "",
+        upload_accepted: bool = False;
+}
+
+obj UploadPreview {
+    has accepted: bool,
+        case_id: str,
+        case_title: str,
+        message: str,
+        filename: str,
+        curated_hint: str;
 }
 
 # ---------------------------------------------------------------------------
@@ -626,8 +646,80 @@ def build_demo_result(run: Run) -> DemoRunResult {
         candidate_label=run.candidate_label,
         candidate_applied=run.candidate_applied,
         stop_reason=run.stop_reason,
-        graph_hint=run.graph_hint
+        graph_hint=run.graph_hint,
+        case_id=run.case_id,
+        case_title=run.case_title,
+        uploaded_filename=run.uploaded_filename,
+        upload_accepted=run.case_id != ""
     );
+}
+
+def rejected_upload_result(upload_match: UploadMatch) -> DemoRunResult {
+    return DemoRunResult(
+        job_id="upload-rejected",
+        current_state="BLOCKED",
+        status="blocked",
+        transitions=[],
+        tool_evidence_available=False,
+        requirement_count=0,
+        toolchain="upload gate · curated cases only",
+        regression_output="",
+        reverify_output="",
+        artifact_manifest="",
+        tool_mode=tools_mode(),
+        llm_mode=llm_mode(),
+        walker_log=[],
+        stop_reason=upload_match.message,
+        case_id="",
+        case_title="",
+        uploaded_filename=upload_match.filename,
+        upload_accepted=False
+    );
+}
+
+def run_case_pipeline(
+    case_id: str,
+    case_title: str,
+    uploaded_filename: str
+) -> DemoRunResult {
+    workspace_root = os.getcwd();
+    output_dir = os.path.join(workspace_root, "runs", case_id + "-demo");
+    run_id = new_run_id();
+    run = root ++> Run(
+        run_id=run_id,
+        title=case_title + " verification",
+        current_state="S0_SPEC_INGEST",
+        status="running",
+        tool_mode=tools_mode(),
+        llm_mode=llm_mode(),
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+        graph_hint="/graph",
+        case_id=case_id,
+        case_title=case_title,
+        uploaded_filename=uploaded_filename
+    );
+
+    root spawn LoadInputsWalker(run_id=run_id);
+    if run.status == "running" {
+        root spawn CompileWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn SimulateWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn StructureFailureWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn RankHypothesesWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn GenerateArtifactWalker(run_id=run_id);
+    }
+    if run.status == "running" {
+        root spawn ReverifyAndRenderWalker(run_id=run_id);
+    }
+    return build_demo_result(run);
 }
 
 # ---------------------------------------------------------------------------
@@ -1383,41 +1475,51 @@ def:pub get_dashboard -> DashboardData {
     );
 }
 
-# Minimal orchestrator: creates a fresh Run, then invokes seven walkers.
+def:pub preview_upload(filename: str, content: str) -> UploadPreview {
+    workspace_root = os.getcwd();
+    upload_match: UploadMatch = identify_uploaded_case(
+        workspace_root,
+        filename,
+        content
+    );
+    return UploadPreview(
+        accepted=upload_match.accepted,
+        case_id=upload_match.case_id,
+        case_title=upload_match.case_title,
+        message=upload_match.message,
+        filename=upload_match.filename,
+        curated_hint="Curated today: demo/fifo/fifo_buggy.sv"
+    );
+}
+
+# Upload-driven entry: real file contents in, curated-case allow-list gate, then walkers.
+def:pub run_uploaded_design(filename: str, content: str) -> DemoRunResult {
+    workspace_root = os.getcwd();
+    upload_match: UploadMatch = identify_uploaded_case(
+        workspace_root,
+        filename,
+        content
+    );
+    if not upload_match.accepted {
+        return rejected_upload_result(upload_match);
+    }
+    return run_case_pipeline(
+        upload_match.case_id,
+        upload_match.case_title,
+        upload_match.filename
+    );
+}
+
+# Convenience path: pretends the curated FIFO RTL was uploaded (demo reliability).
 def:pub run_fifo_demo -> DemoRunResult {
     workspace_root = os.getcwd();
-    output_dir = os.path.join(workspace_root, "runs", "fifo-demo");
-    run_id = new_run_id();
-    run = root ++> Run(
-        run_id=run_id,
-        title="FIFO wraparound verification",
-        current_state="S0_SPEC_INGEST",
-        status="running",
-        tool_mode=tools_mode(),
-        llm_mode=llm_mode(),
-        workspace_root=workspace_root,
-        output_dir=output_dir,
-        graph_hint="/graph"
+    upload_match: UploadMatch = load_curated_case_upload(workspace_root, "fifo");
+    if not upload_match.accepted {
+        return rejected_upload_result(upload_match);
+    }
+    return run_case_pipeline(
+        upload_match.case_id,
+        upload_match.case_title,
+        upload_match.filename
     );
-
-    root spawn LoadInputsWalker(run_id=run_id);
-    if run.status == "running" {
-        root spawn CompileWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn SimulateWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn StructureFailureWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn RankHypothesesWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn GenerateArtifactWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn ReverifyAndRenderWalker(run_id=run_id);
-    }
-    return build_demo_result(run);
 }

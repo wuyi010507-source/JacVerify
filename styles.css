@@ -441,7 +441,7 @@ h1 {
 
 .run-button:disabled {
   opacity: 0.55;
-  cursor: progress;
+  cursor: not-allowed;
 }
 
 .empty-demo,
@@ -596,6 +596,90 @@ h1 {
   font: 11px/1.5 "DM Mono", monospace;
   margin: 8px 0 18px;
   flex-wrap: wrap;
+}
+
+.upload-panel {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.upload-drop {
+  position: relative;
+  display: block;
+  border: 1px dashed #3a5770;
+  background: rgba(16, 33, 53, 0.72);
+  padding: 22px 20px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.upload-drop:hover {
+  border-color: var(--cyan);
+  background: rgba(16, 33, 53, 0.95);
+}
+
+.upload-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.upload-copy h3 {
+  margin: 6px 0 8px;
+  font-size: 20px;
+}
+
+.upload-copy p {
+  margin: 0;
+  color: var(--muted);
+  max-width: 52rem;
+}
+
+.upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.secondary-action {
+  border: 1px solid #3a5770;
+  background: transparent;
+  color: #d7e6f3;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.secondary-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.upload-status {
+  border: 1px solid #3a5770;
+  padding: 12px 14px;
+  display: grid;
+  gap: 6px;
+}
+
+.upload-status.ok {
+  border-color: rgba(82, 242, 177, 0.45);
+}
+
+.upload-status.blocked {
+  border-color: rgba(255, 189, 102, 0.55);
+}
+
+.upload-status p,
+.upload-status small {
+  margin: 0;
+  color: var(--muted);
+}
+
+.empty-demo code {
+  font-family: "DM Mono", monospace;
+  color: var(--cyan);
 }
 
 .evidence-panel {

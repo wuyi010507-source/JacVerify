@@ -99,4 +99,21 @@ def make_hypothesis_draft(
     rank: int, claim: str, confidence: float, next_action: str
 ) -> HypothesisDraft: ...
 def fresh_run_id(prefix: str = "fifo-run") -> str: ...
+
+
+class UploadMatch:
+    accepted: bool
+    case_id: str
+    case_title: str
+    message: str
+    filename: str
+
+
+def identify_uploaded_case(
+    workspace_root: str, filename: str, content: str
+) -> UploadMatch: ...
+def load_curated_case_upload(
+    workspace_root: str, case_id: str = "fifo"
+) -> UploadMatch: ...
+def list_curated_cases() -> list[dict[str, str]]: ...
 def run_fifo_suite(workspace_root: str, output_dir: str) -> FifoSuiteEvidence: ...

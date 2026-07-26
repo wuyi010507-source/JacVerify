@@ -1,12 +1,12 @@
 """JacVerify full-stack entry point."""
 
 import from jacverify.store {
-    DashboardData,
     DemoRunResult,
-    PriorityRecommendation,
     TransitionView,
-    get_dashboard,
+    UploadPreview,
+    preview_upload,
     run_fifo_demo,
+    run_uploaded_design,
 }
 
 cl {
