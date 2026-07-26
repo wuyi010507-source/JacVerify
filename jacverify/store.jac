@@ -151,11 +151,11 @@ def build_recommendations(
 }
 
 def seed_demo_project(target_project_id: str) -> Project {
-    existing = [
-        root -->[?:Project, project_id == target_project_id]
-    ];
-    if existing {
-        return existing[0];
+    existing: list[Project] = [root -->[?:Project]];
+    for project in existing {
+        if project.project_id == target_project_id {
+            return project;
+        }
     }
 
     project = root ++> Project(
@@ -227,11 +227,11 @@ def seed_demo_project(target_project_id: str) -> Project {
 }
 
 def create_fifo_job(target_job_id: str) -> VerificationJob {
-    existing = [
-        root -->[?:VerificationJob, job_id == target_job_id]
-    ];
-    if existing {
-        return existing[0];
+    existing: list[VerificationJob] = [root -->[?:VerificationJob]];
+    for job in existing {
+        if job.job_id == target_job_id {
+            return job;
+        }
     }
     return root ++> VerificationJob(
         job_id=target_job_id,
@@ -430,7 +430,7 @@ walker StateExecutor {
     }
 }
 
-def:pub get_dashboard() -> DashboardData {
+def:pub get_dashboard -> DashboardData {
     project = seed_demo_project("jacverify-demo");
     planner = root spawn ProjectPlanner(project_id=project.project_id);
     recommendations = (
@@ -453,7 +453,7 @@ def:pub get_dashboard() -> DashboardData {
     );
 }
 
-def:pub run_fifo_demo() -> DemoRunResult {
+def:pub run_fifo_demo -> DemoRunResult {
     job = create_fifo_job("fifo-wrap-demo");
     runner = root spawn StateExecutor(job_id=job.job_id);
     transitions = (

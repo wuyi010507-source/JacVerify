@@ -85,8 +85,10 @@ test "project planner walks the graph and reports ranked recommendations" {
 test "demo project seeding is idempotent and produces three choices" {
     first = seed_demo_project("seeded-demo");
     second = seed_demo_project("seeded-demo");
+    all_projects: list[Project] = [root -->[?:Project]];
     matches = [
-        root -->[?:Project, project_id == "seeded-demo"]
+        project for project in all_projects
+        if project.project_id == "seeded-demo"
     ];
 
     assert jid(first) == jid(second);
