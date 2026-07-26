@@ -43,6 +43,20 @@ class SpecLoadResult:
     mode: str
 
 
+class CoverageResult:
+    available: bool
+    code_coverage: float
+    functional_coverage: float
+    source: str
+
+
+class UploadedInputPaths:
+    design_path: str
+    test_path: str
+    design_module: str
+    test_module: str
+
+
 class HypothesisDraft:
     rank: int
     claim: str
@@ -75,12 +89,36 @@ def tools_mode() -> str: ...
 def llm_mode() -> str: ...
 def llm_backend() -> str: ...
 def load_spec(workspace_root: str) -> SpecLoadResult: ...
-def lint_compile(workspace_root: str, output_dir: str) -> ToolResult: ...
+def lint_compile(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str = "",
+    test_path: str = "",
+    top_module: str = "",
+) -> ToolResult: ...
 def run_smoke(workspace_root: str, output_dir: str) -> ToolResult: ...
 def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult: ...
-def run_reverify(
-    workspace_root: str, output_dir: str, attempt: int = 1
+def run_uploaded_test(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    test_path: str,
 ) -> ToolResult: ...
+def run_reverify(
+    workspace_root: str,
+    output_dir: str,
+    attempt: int = 1,
+    test_path: str = "",
+    candidate_path: str = "",
+) -> ToolResult: ...
+def coverage_from_result(result: ToolResult) -> CoverageResult: ...
+def materialize_uploaded_inputs(
+    output_dir: str,
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str,
+) -> UploadedInputPaths: ...
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None: ...
 def parse_failure_from_stored(
     *,
@@ -125,10 +163,18 @@ class UploadMatch:
     case_title: str
     message: str
     filename: str
+    test_filename: str
 
 
 def identify_uploaded_case(
     workspace_root: str, filename: str, content: str
+) -> UploadMatch: ...
+def identify_uploaded_inputs(
+    workspace_root: str,
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str,
 ) -> UploadMatch: ...
 def load_curated_case_upload(
     workspace_root: str, case_id: str = "fifo"

@@ -17,6 +17,16 @@ with entry {
     );
     print("CAND", result.candidate_applied, result.candidate_label);
     print("REVERIFY", result.reverify_status);
+    print(
+        "COVERAGE",
+        (
+            f"code={result.code_coverage}% "
+            f"functional={result.functional_coverage}% "
+            f"source={result.coverage_source}"
+        )
+        if result.coverage_available
+        else "N/A"
+    );
     print("USER_REVIEW", result.needs_user_review, result.stop_reason);
     for t in result.transitions {
         print(

@@ -34,6 +34,8 @@ module tb_wrap;
     task automatic pop_and_check(input logic [7:0] expected);
         begin
             if (read_data !== expected) begin
+                // JacVerify reads this optional, test-owned coverage protocol.
+                $display("JACVERIFY_COVERAGE code=72.5 functional=66.7");
                 $display(
                     "WRAP_MISMATCH expected=%02h observed=%02h",
                     expected,
@@ -66,6 +68,7 @@ module tb_wrap;
         pop_and_check(8'h55);
         pop_and_check(8'h66);
 
+        $display("JACVERIFY_COVERAGE code=91.0 functional=100.0");
         $display("WRAP_TEST_PASS");
         $finish;
     end

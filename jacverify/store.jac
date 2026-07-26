@@ -3,27 +3,29 @@
 import os;
 import from jacverify.tool_adapter {
     ArtifactDraft,
+    CoverageResult,
     FailureEvidence,
     HypothesisDraft,
     SpecLoadResult,
     ToolResult,
     UploadMatch,
+    UploadedInputPaths,
+    coverage_from_result,
     fresh_run_id,
     generate_artifact,
-    identify_uploaded_case,
+    identify_uploaded_inputs,
     lint_compile,
     llm_backend,
     llm_mode,
-    load_curated_case_upload,
     load_spec,
+    materialize_uploaded_inputs,
     make_artifact_draft,
     make_hypothesis_draft,
     read_text_file,
     parse_failure_from_stored,
     rank_hypotheses,
     run_reverify,
-    run_smoke,
-    run_wrap_regression,
+    run_uploaded_test,
     tools_mode
 }
 import from jacverify.llm_calls {
@@ -87,6 +89,10 @@ node Test {
         run_id: str,
         status: str = "NOT_RUN",
         stdout: str = "",
+        coverage_available: bool = False,
+        code_coverage: float = 0.0,
+        functional_coverage: float = 0.0,
+        coverage_source: str = "not_reported",
         source_walker: str = "";
 }
 
@@ -131,7 +137,16 @@ node Run {
         graph_hint: str = "/graph",
         case_id: str = "",
         case_title: str = "",
-        uploaded_filename: str = "";
+        uploaded_filename: str = "",
+        uploaded_test_filename: str = "",
+        input_design_path: str = "",
+        input_test_path: str = "",
+        testbench_name: str = "",
+        reviewed_candidate_available: bool = False,
+        coverage_available: bool = False,
+        code_coverage: float = 0.0,
+        functional_coverage: float = 0.0,
+        coverage_source: str = "not_reported";
 }
 
 node Failure {
@@ -285,6 +300,11 @@ obj DemoRunResult {
         case_id: str = "",
         case_title: str = "",
         uploaded_filename: str = "",
+        uploaded_test_filename: str = "",
+        coverage_available: bool = False,
+        code_coverage: float = 0.0,
+        functional_coverage: float = 0.0,
+        coverage_source: str = "not_reported",
         upload_accepted: bool = False;
 }
 
@@ -294,6 +314,7 @@ obj UploadPreview {
         case_title: str,
         message: str,
         filename: str,
+        test_filename: str,
         curated_hint: str;
 }
 
@@ -662,10 +683,14 @@ def build_demo_result(run: Run) -> DemoRunResult {
     tool_ok = (
         run.status == "complete"
         and run.compile_status == "PASSED"
-        and run.smoke_status == "PASSED"
-        and run.regression_status == "VERIFICATION_FAILED"
-        and run.reverify_status == "PASSED"
-        and run.candidate_applied
+        and (
+            run.regression_status == "PASSED"
+            or (
+                run.regression_status == "VERIFICATION_FAILED"
+                and run.reverify_status == "PASSED"
+                and run.candidate_applied
+            )
+        )
     );
     return DemoRunResult(
         job_id=run.run_id,
@@ -703,6 +728,11 @@ def build_demo_result(run: Run) -> DemoRunResult {
         case_id=run.case_id,
         case_title=run.case_title,
         uploaded_filename=run.uploaded_filename,
+        uploaded_test_filename=run.uploaded_test_filename,
+        coverage_available=run.coverage_available,
+        code_coverage=run.code_coverage,
+        functional_coverage=run.functional_coverage,
+        coverage_source=run.coverage_source,
         upload_accepted=run.case_id != ""
     );
 }
@@ -726,6 +756,7 @@ def rejected_upload_result(upload_match: UploadMatch) -> DemoRunResult {
         case_id="",
         case_title="",
         uploaded_filename=upload_match.filename,
+        uploaded_test_filename=upload_match.test_filename,
         upload_accepted=False
     );
 }
@@ -733,11 +764,21 @@ def rejected_upload_result(upload_match: UploadMatch) -> DemoRunResult {
 def run_case_pipeline(
     case_id: str,
     case_title: str,
-    uploaded_filename: str
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str
 ) -> DemoRunResult {
     workspace_root = os.getcwd();
-    output_dir = os.path.join(workspace_root, "runs", case_id + "-demo");
     run_id = new_run_id();
+    output_dir = os.path.join(workspace_root, "runs", run_id);
+    inputs: UploadedInputPaths = materialize_uploaded_inputs(
+        output_dir,
+        design_filename,
+        design_content,
+        test_filename,
+        test_content
+    );
     run = root ++> Run(
         run_id=run_id,
         title=case_title + " verification",
@@ -750,7 +791,14 @@ def run_case_pipeline(
         graph_hint="/graph",
         case_id=case_id,
         case_title=case_title,
-        uploaded_filename=uploaded_filename
+        uploaded_filename=design_filename,
+        uploaded_test_filename=test_filename,
+        input_design_path=inputs.design_path,
+        input_test_path=inputs.test_path,
+        module_name=inputs.design_module,
+        module_path=inputs.design_path,
+        testbench_name=inputs.test_module,
+        reviewed_candidate_available=case_id == "fifo"
     );
 
     root spawn LoadInputsWalker(run_id=run_id);
@@ -908,20 +956,36 @@ walker LoadInputsWalker {
             skip;
         }
         try {
-            spec: SpecLoadResult = load_spec(here.workspace_root);
-            here.requirement_count = spec.requirement_count;
-            here.module_name = spec.module_name;
-            here.module_path = spec.module_path;
+            if not here.input_design_path or not here.input_test_path {
+                raise ValueError("Uploaded design/test paths are missing");
+            }
             module_node = here +>:OwnsModule:+> Module(
-                module_name=spec.module_name,
-                rtl_path=spec.module_path,
+                module_name=here.module_name,
+                rtl_path=here.input_design_path,
                 run_id=here.run_id,
                 source_walker="LoadInputsWalker"
             );
-            for req in spec.requirements {
+            evidence_ids = [here.input_design_path, here.input_test_path];
+            if here.case_id == "fifo" {
+                spec: SpecLoadResult = load_spec(here.workspace_root);
+                here.requirement_count = spec.requirement_count;
+                for req in spec.requirements {
+                    here +>:OwnsRequirement:+> Requirement(
+                        req_id=req.req_id,
+                        text=req.text,
+                        run_id=here.run_id,
+                        source_walker="LoadInputsWalker"
+                    );
+                }
+                evidence_ids.append(spec.spec_path);
+            } else {
+                here.requirement_count = 1;
                 here +>:OwnsRequirement:+> Requirement(
-                    req_id=req.req_id,
-                    text=req.text,
+                    req_id="REQ-UPLOADED-TEST",
+                    text=(
+                        "The uploaded testbench defines the executable "
+                        "pass/fail contract for this run."
+                    ),
                     run_id=here.run_id,
                     source_walker="LoadInputsWalker"
                 );
@@ -930,10 +994,13 @@ walker LoadInputsWalker {
                 here,
                 "S0_SPEC_INGEST",
                 "S3_STATIC_CHECK",
-                "spec_and_design_loaded",
-                f"Loaded {spec.requirement_count} requirements and module {spec.module_name}.",
+                "design_and_test_loaded",
+                (
+                    f"Loaded design module {here.module_name} and uploaded "
+                    f"testbench {here.testbench_name}."
+                ),
                 "tool_fact",
-                [spec.spec_path, spec.module_path],
+                evidence_ids,
                 "LoadInputsWalker"
             );
         } except Exception as exc {
@@ -971,7 +1038,13 @@ walker CompileWalker {
             block_run(here, "CompileWalker refused: inputs missing", "CompileWalker");
             skip;
         }
-        result: ToolResult = lint_compile(here.workspace_root, here.output_dir);
+        result: ToolResult = lint_compile(
+            here.workspace_root,
+            here.output_dir,
+            here.input_design_path,
+            here.input_test_path,
+            here.testbench_name
+        );
         here.compile_status = result.status;
         here.compile_stdout = result.stdout;
         if result.status == "PASSED" {
@@ -1032,67 +1105,41 @@ walker SimulateWalker {
         }
         module_node = modules[0];
 
-        smoke: ToolResult = run_smoke(here.workspace_root, here.output_dir);
-        here.smoke_status = smoke.status;
-        here.smoke_stdout = smoke.stdout;
-        smoke_test = here +>:Executes:+> Test(
-            test_id=here.run_id + ":smoke",
-            name="tb_smoke",
-            kind="smoke",
-            status=smoke.status,
-            stdout=smoke.stdout,
-            run_id=here.run_id,
-            source_walker="SimulateWalker"
+        regression: ToolResult = run_uploaded_test(
+            here.workspace_root,
+            here.output_dir,
+            here.input_design_path,
+            here.input_test_path
         );
-        smoke_test +>:Targets:+> module_node;
-        for req in [here ->:OwnsRequirement:->] {
-            if "ORDER" in req.req_id or "RESET" in req.req_id {
-                req +>:Verifies:+> smoke_test;
-            }
-        }
-
-        if smoke.status != "PASSED" {
-            block_run(
-                here,
-                f"Smoke did not pass ({smoke.status})",
-                "SimulateWalker"
-            );
-            append_transition(
-                here,
-                "S4_COMPILE_ELAB",
-                "BLOCKED",
-                "smoke_failed",
-                f"Smoke result {smoke.status}.",
-                "tool_fact",
-                [f"status:{smoke.status}"],
-                "SimulateWalker"
-            );
-            skip;
-        }
-
-        regression: ToolResult = run_wrap_regression(here.workspace_root, here.output_dir);
         here.regression_status = regression.status;
         here.regression_stdout = regression.stdout;
         here.regression_tool = regression.tool;
+        coverage: CoverageResult = coverage_from_result(regression);
+        here.coverage_available = coverage.available;
+        here.code_coverage = coverage.code_coverage;
+        here.functional_coverage = coverage.functional_coverage;
+        here.coverage_source = coverage.source;
         if regression.exit_code is not None {
             here.regression_exit_code = regression.exit_code;
         } else {
             here.regression_exit_code = -1;
         }
-        wrap_test = here +>:Executes:+> Test(
-            test_id=here.run_id + ":wrap",
-            name="tb_wrap",
-            kind="wraparound",
+        uploaded_test = here +>:Executes:+> Test(
+            test_id=here.run_id + ":uploaded-test",
+            name=here.testbench_name,
+            kind="uploaded",
             status=regression.status,
             stdout=regression.stdout,
+            coverage_available=coverage.available,
+            code_coverage=coverage.code_coverage,
+            functional_coverage=coverage.functional_coverage,
+            coverage_source=coverage.source,
             run_id=here.run_id,
             source_walker="SimulateWalker"
         );
-        wrap_test +>:Targets:+> module_node;
+        uploaded_test +>:Targets:+> module_node;
         for req in [here ->:OwnsRequirement:->] {
-            if "ORDER" in req.req_id or "FULL" in req.req_id {
-                req +>:Verifies:+> wrap_test;
-            }
+            req +>:Verifies:+> uploaded_test;
         }
 
         if regression.status == "VERIFICATION_FAILED" {
@@ -1100,10 +1147,16 @@ walker SimulateWalker {
                 here,
                 "S4_COMPILE_ELAB",
                 "S6_REGRESSION",
-                "wraparound_verification_failed",
-                "Wraparound regression reported VERIFICATION_FAILED (defect discovery).",
+                "uploaded_test_failed",
+                (
+                    f"Uploaded testbench {here.testbench_name} reported "
+                    "VERIFICATION_FAILED."
+                ),
                 "tool_fact",
-                [f"status:{regression.status}", "test:tb_wrap"],
+                [
+                    f"status:{regression.status}",
+                    f"test:{here.uploaded_test_filename}"
+                ],
                 "SimulateWalker"
             );
             append_transition(
@@ -1113,21 +1166,32 @@ walker SimulateWalker {
                 "ready_to_structure_failure",
                 "Defect evidence available for structuring.",
                 "tool_fact",
-                ["test:tb_wrap"],
+                [f"test:{here.uploaded_test_filename}"],
                 "SimulateWalker"
             );
-        } elif regression.status == "BUG_NOT_REPRODUCED" {
-            block_run(here, "BUG_NOT_REPRODUCED: buggy RTL unexpectedly passed", "SimulateWalker");
+        } elif regression.status == "PASSED" {
             append_transition(
                 here,
                 "S4_COMPILE_ELAB",
-                "BLOCKED",
-                "bug_not_reproduced",
-                "Buggy wraparound regression passed; refusing to invent failure evidence.",
+                "S9_SIGNOFF_GATE",
+                "uploaded_test_passed",
+                f"Uploaded testbench {here.testbench_name} passed.",
                 "tool_fact",
                 [f"status:{regression.status}"],
                 "SimulateWalker"
             );
+            append_transition(
+                here,
+                "S9_SIGNOFF_GATE",
+                "DONE",
+                "evidence_trace_complete",
+                "Uploaded design/test evidence is ready for inspection.",
+                "tool_fact",
+                ["graph:/graph", f"run:{here.run_id}"],
+                "SimulateWalker"
+            );
+            here.status = "complete";
+            here.current_state = "DONE";
         } else {
             block_run(
                 here,
@@ -1252,6 +1316,24 @@ walker RankHypothesesWalker {
                 "debug_state_requires_review",
                 "graph_invariant",
                 ["error:wrong_state"],
+                "RankHypothesesWalker"
+            );
+            skip;
+        }
+        if not here.reviewed_candidate_available {
+            request_user_review(
+                here,
+                (
+                    "The uploaded test failed and its evidence was captured. "
+                    "Automatic remediation is disabled because this design has "
+                    "no reviewed candidate fixture."
+                ),
+                "uploaded_test_failure_requires_review",
+                "policy_decision",
+                [
+                    f"design:{here.uploaded_filename}",
+                    f"test:{here.uploaded_test_filename}"
+                ],
                 "RankHypothesesWalker"
             );
             skip;
@@ -1578,10 +1660,19 @@ walker ReverifyAndRenderWalker {
         result: ToolResult = run_reverify(
             here.workspace_root,
             here.output_dir,
-            here.debug_attempt
+            here.debug_attempt,
+            here.input_test_path,
+            here.candidate_path
         );
         here.reverify_status = result.status;
         here.reverify_stdout = result.stdout;
+        coverage: CoverageResult = coverage_from_result(result);
+        if coverage.available {
+            here.coverage_available = True;
+            here.code_coverage = coverage.code_coverage;
+            here.functional_coverage = coverage.functional_coverage;
+            here.coverage_source = coverage.source;
+        }
         artifact_node.reverify_status = result.status;
         reverify_run_id = here.run_id + f":reverify:{here.debug_attempt}";
         reverify_state = result.status;
@@ -1603,7 +1694,11 @@ walker ReverifyAndRenderWalker {
             reverify_stdout=result.stdout,
             candidate_applied=True,
             candidate_label=here.candidate_label,
-            candidate_path=here.candidate_path
+            candidate_path=here.candidate_path,
+            coverage_available=coverage.available,
+            code_coverage=coverage.code_coverage,
+            functional_coverage=coverage.functional_coverage,
+            coverage_source=coverage.source
         );
         artifact_node +>:ReverifiedBy:+> reverify_run;
 
@@ -1831,12 +1926,19 @@ def:pub get_dashboard -> DashboardData {
     );
 }
 
-def:pub preview_upload(filename: str, content: str) -> UploadPreview {
+def:pub preview_uploaded_inputs(
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str
+) -> UploadPreview {
     workspace_root = os.getcwd();
-    upload_match: UploadMatch = identify_uploaded_case(
+    upload_match: UploadMatch = identify_uploaded_inputs(
         workspace_root,
-        filename,
-        content
+        design_filename,
+        design_content,
+        test_filename,
+        test_content
     );
     return UploadPreview(
         accepted=upload_match.accepted,
@@ -1844,17 +1946,40 @@ def:pub preview_upload(filename: str, content: str) -> UploadPreview {
         case_title=upload_match.case_title,
         message=upload_match.message,
         filename=upload_match.filename,
-        curated_hint="Curated today: demo/fifo/fifo_buggy.sv"
+        test_filename=upload_match.test_filename,
+        curated_hint=(
+            "Any SystemVerilog design/test pair can run. Automatic repair "
+            "remains limited to reviewed fixtures."
+        )
     );
 }
 
-# Upload-driven entry: real file contents in, curated-case allow-list gate, then walkers.
-def:pub run_uploaded_design(filename: str, content: str) -> DemoRunResult {
+def:pub preview_curated_inputs -> UploadPreview {
     workspace_root = os.getcwd();
-    upload_match: UploadMatch = identify_uploaded_case(
+    design_path = os.path.join(workspace_root, "demo", "fifo", "fifo_buggy.sv");
+    test_path = os.path.join(workspace_root, "demo", "fifo", "tb_wrap.sv");
+    return preview_uploaded_inputs(
+        "fifo_buggy.sv",
+        read_text_file(design_path),
+        "tb_wrap.sv",
+        read_text_file(test_path)
+    );
+}
+
+# Upload-driven entry: the simulator receives exactly these two file contents.
+def:pub run_uploaded_inputs(
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str
+) -> DemoRunResult {
+    workspace_root = os.getcwd();
+    upload_match: UploadMatch = identify_uploaded_inputs(
         workspace_root,
-        filename,
-        content
+        design_filename,
+        design_content,
+        test_filename,
+        test_content
     );
     if not upload_match.accepted {
         return rejected_upload_result(upload_match);
@@ -1862,20 +1987,22 @@ def:pub run_uploaded_design(filename: str, content: str) -> DemoRunResult {
     return run_case_pipeline(
         upload_match.case_id,
         upload_match.case_title,
-        upload_match.filename
+        upload_match.filename,
+        design_content,
+        upload_match.test_filename,
+        test_content
     );
 }
 
-# Convenience path: pretends the curated FIFO RTL was uploaded (demo reliability).
+# Convenience path: loads both curated files through the same generic pair API.
 def:pub run_fifo_demo -> DemoRunResult {
     workspace_root = os.getcwd();
-    upload_match: UploadMatch = load_curated_case_upload(workspace_root, "fifo");
-    if not upload_match.accepted {
-        return rejected_upload_result(upload_match);
-    }
-    return run_case_pipeline(
-        upload_match.case_id,
-        upload_match.case_title,
-        upload_match.filename
+    design_path = os.path.join(workspace_root, "demo", "fifo", "fifo_buggy.sv");
+    test_path = os.path.join(workspace_root, "demo", "fifo", "tb_wrap.sv");
+    return run_uploaded_inputs(
+        "fifo_buggy.sv",
+        read_text_file(design_path),
+        "tb_wrap.sv",
+        read_text_file(test_path)
     );
 }

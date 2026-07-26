@@ -9,11 +9,14 @@ from jacverify.tool_adapter import (
     STATUS_PASSED,
     STATUS_TOOL_ERROR,
     STATUS_VERIFICATION_FAILED,
+    coverage_from_result,
     generate_artifact,
     identify_uploaded_case,
+    identify_uploaded_inputs,
     lint_compile,
     load_curated_case_upload,
     load_spec,
+    materialize_uploaded_inputs,
     parse_failure_evidence,
     rank_hypotheses,
     run_fifo_suite,
@@ -195,3 +198,54 @@ def test_upload_matches_curated_fifo_by_content() -> None:
     assert not rejected.accepted
     assert curated.accepted
     assert curated.filename == "fifo_buggy.sv"
+
+
+def test_design_and_test_uploads_are_independent(tmp_path: Path) -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    design = (workspace / "demo" / "fifo" / "fifo_buggy.sv").read_text(
+        encoding="utf-8"
+    )
+    testbench = (workspace / "demo" / "fifo" / "tb_wrap.sv").read_text(
+        encoding="utf-8"
+    )
+    generic_design = "module adder; endmodule\n"
+    generic_test = "module adder_test; initial $finish; endmodule\n"
+
+    curated = identify_uploaded_inputs(
+        str(workspace),
+        "design.sv",
+        design,
+        "test.sv",
+        testbench,
+    )
+    generic = identify_uploaded_inputs(
+        str(workspace),
+        "adder.sv",
+        generic_design,
+        "adder_test.sv",
+        generic_test,
+    )
+    paths = materialize_uploaded_inputs(
+        str(tmp_path),
+        "adder.sv",
+        generic_design,
+        "adder_test.sv",
+        generic_test,
+    )
+
+    assert curated.accepted and curated.case_id == "fifo"
+    assert generic.accepted and generic.case_id == "uploaded"
+    assert Path(paths.design_path).read_text(encoding="utf-8") == generic_design
+    assert Path(paths.test_path).read_text(encoding="utf-8") == generic_test
+    assert paths.design_module == "adder"
+    assert paths.test_module == "adder_test"
+
+
+def test_coverage_marker_is_parsed_from_test_output(tmp_path: Path) -> None:
+    result = run_wrap_regression(".", str(tmp_path))
+    coverage = coverage_from_result(result)
+
+    assert coverage.available
+    assert coverage.code_coverage == 72.5
+    assert coverage.functional_coverage == 66.7
+    assert coverage.source == "mock:testbench_marker"

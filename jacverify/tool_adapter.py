@@ -24,6 +24,11 @@ STATUS_NOT_RUN = "NOT_RUN"
 WRAP_MISMATCH_RE = re.compile(
     r"WRAP_MISMATCH\s+expected=([0-9A-Fa-f]+)\s+observed=([0-9A-Fa-f]+)"
 )
+COVERAGE_RE = re.compile(
+    r"JACVERIFY_COVERAGE\s+code=([0-9]+(?:\.[0-9]+)?)"
+    r"\s+functional=([0-9]+(?:\.[0-9]+)?)"
+)
+MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,22 @@ class SpecLoadResult:
     module_path: str
     module_name: str
     mode: str
+
+
+@dataclass(frozen=True)
+class CoverageResult:
+    available: bool
+    code_coverage: float
+    functional_coverage: float
+    source: str
+
+
+@dataclass(frozen=True)
+class UploadedInputPaths:
+    design_path: str
+    test_path: str
+    design_module: str
+    test_module: str
 
 
 # Backward-compatible aliases used by older tests during migration.
@@ -171,15 +192,46 @@ def load_spec(workspace_root: str) -> SpecLoadResult:
 
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
     match = WRAP_MISMATCH_RE.search(result.stdout or "")
-    if not match:
-        return None
-    return FailureEvidence(
-        kind="WRAP_MISMATCH",
-        expected=match.group(1),
-        observed=match.group(2),
-        cycle=None,
-        raw_stdout=result.stdout,
-        source_result=result,
+    if match:
+        return FailureEvidence(
+            kind="WRAP_MISMATCH",
+            expected=match.group(1),
+            observed=match.group(2),
+            cycle=None,
+            raw_stdout=result.stdout,
+            source_result=result,
+        )
+    if result.status == STATUS_VERIFICATION_FAILED:
+        return FailureEvidence(
+            kind="TEST_FAILURE",
+            expected=None,
+            observed=None,
+            cycle=None,
+            raw_stdout=result.stdout or result.stderr,
+            source_result=result,
+        )
+    return None
+
+
+def coverage_from_result(result: ToolResult) -> CoverageResult:
+    matches = list(COVERAGE_RE.finditer(result.stdout or ""))
+    if not matches:
+        return CoverageResult(
+            available=False,
+            code_coverage=0.0,
+            functional_coverage=0.0,
+            source="not_reported",
+        )
+    match = matches[-1]
+    return CoverageResult(
+        available=True,
+        code_coverage=min(100.0, max(0.0, float(match.group(1)))),
+        functional_coverage=min(100.0, max(0.0, float(match.group(2)))),
+        source=(
+            "mock:testbench_marker"
+            if result.mode == "mock"
+            else "testbench_marker"
+        ),
     )
 
 
@@ -257,7 +309,10 @@ def _mock_smoke() -> ToolResult:
 
 def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
     if reproduce_bug:
-        stdout = "WRAP_MISMATCH expected=55 observed=33\n"
+        stdout = (
+            "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
+            "WRAP_MISMATCH expected=55 observed=33\n"
+        )
         return ToolResult(
             tool="vvp",
             mode="mock",
@@ -277,7 +332,10 @@ def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
         exit_code=0,
         command=["mock:vvp", "wrap_regression.vvp"],
         duration_ms=2,
-        stdout="WRAP_TEST_PASS\n",
+        stdout=(
+            "JACVERIFY_COVERAGE code=88.0 functional=100.0\n"
+            "WRAP_TEST_PASS\n"
+        ),
         stderr="",
         artifacts=["mock:wrap_regression.vvp"],
         diagnostics={"stage": "wrap_regression", "test": "tb_wrap"},
@@ -293,7 +351,10 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
             exit_code=0,
             command=["mock:vvp", "patched_reverify.vvp"],
             duration_ms=2,
-            stdout="WRAP_TEST_PASS\n",
+            stdout=(
+                "JACVERIFY_COVERAGE code=91.0 functional=100.0\n"
+                "WRAP_TEST_PASS\n"
+            ),
             stderr="",
             artifacts=["mock:patched_reverify.vvp"],
             diagnostics={
@@ -309,7 +370,10 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
         exit_code=1,
         command=["mock:vvp", "patched_reverify.vvp"],
         duration_ms=2,
-        stdout="WRAP_MISMATCH expected=55 observed=33\n",
+        stdout=(
+            "JACVERIFY_COVERAGE code=78.0 functional=66.7\n"
+            "WRAP_MISMATCH expected=55 observed=33\n"
+        ),
         stderr="",
         artifacts=["mock:patched_reverify.vvp"],
         diagnostics={
@@ -379,7 +443,55 @@ def _ensure_output_dir(output_dir: str) -> Path:
     return artifacts
 
 
-def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
+def _safe_upload_name(filename: str, fallback: str) -> str:
+    basename = Path(filename or "").name.strip()
+    if not basename or basename in {".", ".."}:
+        return fallback
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", basename)
+
+
+def _module_name(source: str, label: str) -> str:
+    match = MODULE_RE.search(source)
+    if not match:
+        raise ValueError(f"{label} does not declare a SystemVerilog module")
+    return match.group(1)
+
+
+def materialize_uploaded_inputs(
+    output_dir: str,
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str,
+) -> UploadedInputPaths:
+    """Write a user-supplied design/test pair into an isolated run directory."""
+    inputs_dir = _ensure_output_dir(output_dir) / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    design_name = _safe_upload_name(design_filename, "design.sv")
+    test_name = _safe_upload_name(test_filename, "testbench.sv")
+    if design_name == test_name:
+        test_name = f"test_{test_name}"
+    design_path = inputs_dir / design_name
+    test_path = inputs_dir / test_name
+    normalized_design = normalize_source(design_content)
+    normalized_test = normalize_source(test_content)
+    design_path.write_text(normalized_design, encoding="utf-8")
+    test_path.write_text(normalized_test, encoding="utf-8")
+    return UploadedInputPaths(
+        design_path=str(design_path),
+        test_path=str(test_path),
+        design_module=_module_name(normalized_design, "Uploaded design"),
+        test_module=_module_name(normalized_test, "Uploaded testbench"),
+    )
+
+
+def lint_compile(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str = "",
+    test_path: str = "",
+    top_module: str = "",
+) -> ToolResult:
     if tools_mode() == "mock":
         return _mock_compile()
     if shutil.which("iverilog") is None:
@@ -391,20 +503,31 @@ def lint_compile(workspace_root: str, output_dir: str) -> ToolResult:
             stderr="iverilog not found on PATH",
             diagnostics={"error": "executable_not_found", "stage": "compile"},
         )
-    paths = _fifo_paths(workspace_root)
+    rtl = (
+        Path(design_path).resolve()
+        if design_path
+        else _fifo_paths(workspace_root)["buggy_rtl"]
+    )
+    testbench = Path(test_path).resolve() if test_path else None
     artifacts = _ensure_output_dir(output_dir)
+    command = ["iverilog", "-g2012", "-tnull"]
+    if top_module:
+        command.extend(["-s", top_module])
+    else:
+        command.extend(["-s", "fifo"])
+    command.append(str(rtl))
+    if testbench is not None:
+        command.append(str(testbench))
     result = _execute(
         tool="iverilog",
-        command=[
-            "iverilog",
-            "-g2012",
-            "-tnull",
-            "-s",
-            "fifo",
-            str(paths["buggy_rtl"]),
-        ],
+        command=command,
         cwd=artifacts,
-        diagnostics={"stage": "compile"},
+        diagnostics={
+            "stage": "compile",
+            "design": str(rtl),
+            "test": str(testbench) if testbench is not None else "",
+            "top": top_module or "fifo",
+        },
     )
     if result.status == STATUS_PASSED:
         return result
@@ -430,6 +553,7 @@ def _compile_and_simulate(
     rtl: Path,
     testbench: Path,
     output_dir: Path,
+    top_module: str = "",
 ) -> ToolResult:
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         return _tool_error(
@@ -447,7 +571,7 @@ def _compile_and_simulate(
             "iverilog",
             "-g2012",
             "-s",
-            testbench.stem,
+            top_module or testbench.stem,
             "-o",
             str(binary),
             str(rtl),
@@ -494,7 +618,7 @@ def _compile_and_simulate(
 def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
     if tools_mode() == "mock":
         return _mock_smoke()
-    paths = _fifo_paths(workspace_root)
+    paths = _fifo_paths(workspace_root) if not candidate_path or not test_path else {}
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="smoke",
@@ -578,10 +702,68 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
     )
 
 
+def run_uploaded_test(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    test_path: str,
+) -> ToolResult:
+    """Compile and execute exactly the uploaded design/test pair."""
+    if tools_mode() == "mock":
+        force = os.environ.get("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", "")
+        return _mock_regression(reproduce_bug=force != "1")
+    artifacts = _ensure_output_dir(output_dir)
+    result = _compile_and_simulate(
+        stage="uploaded_test",
+        rtl=Path(design_path).resolve(),
+        testbench=Path(test_path).resolve(),
+        output_dir=artifacts,
+        top_module=_module_name(
+            Path(test_path).read_text(encoding="utf-8"),
+            "Uploaded testbench",
+        ),
+    )
+    diagnostics = {
+        **result.diagnostics,
+        "stage": "uploaded_test",
+        "design": design_path,
+        "test": test_path,
+    }
+    if result.status == STATUS_PASSED and result.exit_code == 0:
+        return ToolResult(
+            tool=result.tool,
+            mode=result.mode,
+            status=STATUS_PASSED,
+            exit_code=result.exit_code,
+            command=result.command,
+            duration_ms=result.duration_ms,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            artifacts=result.artifacts,
+            diagnostics=diagnostics,
+        )
+    if result.diagnostics.get("error"):
+        return result
+    return ToolResult(
+        tool=result.tool,
+        mode=result.mode,
+        status=STATUS_VERIFICATION_FAILED,
+        exit_code=result.exit_code if result.exit_code is not None else 1,
+        command=result.command,
+        duration_ms=result.duration_ms,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        artifacts=result.artifacts,
+        diagnostics=diagnostics,
+    )
+
+
 def run_reverify(
     workspace_root: str,
     output_dir: str,
     attempt: int = 1,
+    test_path: str = "",
+    candidate_path: str = "",
 ) -> ToolResult:
     if tools_mode() == "mock":
         sequence_raw = os.environ.get("JACVERIFY_REVERIFY_SEQUENCE", "").strip()
@@ -626,18 +808,33 @@ def run_reverify(
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
     paths = _fifo_paths(workspace_root)
+    candidate = (
+        Path(candidate_path).resolve()
+        if candidate_path and Path(candidate_path).is_absolute()
+        else (
+            (Path(workspace_root).resolve() / candidate_path).resolve()
+            if candidate_path
+            else paths["fixed_rtl"]
+        )
+    )
+    testbench = Path(test_path).resolve() if test_path else paths["wrap_tb"]
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="patched_reverify",
-        rtl=paths["fixed_rtl"],
-        testbench=paths["wrap_tb"],
+        rtl=candidate,
+        testbench=testbench,
         output_dir=artifacts,
+        top_module=_module_name(
+            testbench.read_text(encoding="utf-8"),
+            "Uploaded testbench",
+        ),
     )
     diagnostics = {
         **result.diagnostics,
         "stage": "patched_reverify",
-        "candidate": str(paths["fixed_rtl"]),
+        "candidate": str(candidate),
         "candidate_kind": "reviewed_fixture",
+        "test": str(testbench),
     }
     if result.status == STATUS_PASSED and "WRAP_TEST_PASS" in result.stdout:
         return ToolResult(
@@ -1110,6 +1307,7 @@ class CuratedCase:
     title: str
     description: str
     buggy_relpath: str
+    test_relpath: str
     accepted_filenames: tuple[str, ...]
 
 
@@ -1120,6 +1318,7 @@ class UploadMatch:
     case_title: str
     message: str
     filename: str
+    test_filename: str = ""
 
 
 CURATED_CASES: tuple[CuratedCase, ...] = (
@@ -1131,6 +1330,7 @@ CURATED_CASES: tuple[CuratedCase, ...] = (
             "Hackathon demo uses a reviewed fix fixture for re-verification."
         ),
         buggy_relpath="demo/fifo/fifo_buggy.sv",
+        test_relpath="demo/fifo/tb_wrap.sv",
         accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
     ),
 )
@@ -1143,6 +1343,7 @@ def list_curated_cases() -> list[dict[str, str]]:
             "title": case.title,
             "description": case.description,
             "buggy_relpath": case.buggy_relpath,
+            "test_relpath": case.test_relpath,
             "accepted_filenames": ", ".join(case.accepted_filenames),
         }
         for case in CURATED_CASES
@@ -1205,6 +1406,85 @@ def identify_uploaded_case(
             "Try uploading demo/fifo/fifo_buggy.sv."
         ),
         filename=basename,
+    )
+
+
+def identify_uploaded_inputs(
+    workspace_root: str,
+    design_filename: str,
+    design_content: str,
+    test_filename: str,
+    test_content: str,
+) -> UploadMatch:
+    """Validate a design/test pair and recognize optional curated fixtures."""
+    design_basename = _safe_upload_name(design_filename, "design.sv")
+    test_basename = _safe_upload_name(test_filename, "testbench.sv")
+    if not design_content or not design_content.strip():
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message="Upload an RTL design file to continue.",
+            filename=design_basename,
+            test_filename=test_basename,
+        )
+    if not test_content or not test_content.strip():
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message="Upload a testbench file to continue.",
+            filename=design_basename,
+            test_filename=test_basename,
+        )
+    try:
+        _module_name(design_content, "Uploaded design")
+        _module_name(test_content, "Uploaded testbench")
+    except ValueError as exc:
+        return UploadMatch(
+            accepted=False,
+            case_id="",
+            case_title="",
+            message=str(exc),
+            filename=design_basename,
+            test_filename=test_basename,
+        )
+
+    design_fp = source_fingerprint(design_content)
+    test_fp = source_fingerprint(test_content)
+    for case in CURATED_CASES:
+        root = Path(workspace_root).resolve()
+        design_path = root / case.buggy_relpath
+        test_path = root / case.test_relpath
+        if not design_path.is_file() or not test_path.is_file():
+            continue
+        if (
+            design_fp == source_fingerprint(design_path.read_text(encoding="utf-8"))
+            and test_fp == source_fingerprint(test_path.read_text(encoding="utf-8"))
+        ):
+            return UploadMatch(
+                accepted=True,
+                case_id=case.case_id,
+                case_title=case.title,
+                message=(
+                    f"Ready: `{design_basename}` will be verified by "
+                    f"`{test_basename}`. This pair also matches the reviewed "
+                    "FIFO demo fixture."
+                ),
+                filename=design_basename,
+                test_filename=test_basename,
+            )
+
+    return UploadMatch(
+        accepted=True,
+        case_id="uploaded",
+        case_title="Uploaded design verification",
+        message=(
+            f"Ready: `{design_basename}` will be compiled and verified using "
+            f"the uploaded testbench `{test_basename}`."
+        ),
+        filename=design_basename,
+        test_filename=test_basename,
     )
 
 

@@ -75,11 +75,26 @@ Open [http://localhost:8000](http://localhost:8000).
 
 Upload path (product UX):
 
-1. Choose `demo/fifo/fifo_buggy.sv` in **Design upload**, or click **Use curated sample**.
-2. Click **Run verification loop**.
-3. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
+1. Choose an RTL module in **Design RTL**.
+2. Choose its independent SystemVerilog testbench in **Testbench**.
+3. Click **Run verification loop**, or use the curated FIFO pair.
+4. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
 
-Uploads are real file reads. Execution is allow-listed to curated hackathon cases so the demo stays reliable. Unknown RTL is rejected with an explicit message (no silent fallback).
+The compile and simulation commands use exactly the two uploaded files, saved
+under that run's isolated `runs/<run-id>/inputs/` directory. Any valid
+SystemVerilog module/test pair can run. Automatic candidate application remains
+restricted to reviewed fixtures; an unrecognized failing design stops at
+`NEEDS_USER_REVIEW` after recording tool evidence.
+
+Coverage is optional and test-owned. A testbench can publish both metrics with:
+
+```systemverilog
+$display("JACVERIFY_COVERAGE code=82.5 functional=75.0");
+```
+
+JacVerify parses the last such marker and displays code and functional
+coverage. If the test does not report coverage, the UI shows `N/A` rather than
+inventing a value. Mock results are explicitly labeled `mock:testbench_marker`.
 
 For a terminal-only demo:
 
@@ -140,14 +155,14 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/test_tool_adapter.py -q
 ## What is live vs mocked
 
 - **Always Jac-orchestrated:** seven walkers, graph nodes/edges, transition records.
-- **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise real Icarus compile/sim/reverify.
+- **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise Icarus compiles and runs the uploaded design/test pair.
 - **LLM:** deterministic outputs in mock mode; Firecrawl Agent is the current experimental live adapter, with typed Jac byLLM retained as an alternative.
 - **Fixed RTL:** `demo/fifo/fifo_fixed.sv` is a **pre-reviewed candidate fixture**, not an LLM-authored patch. Re-verification PASS comes only from the simulator `ToolResult`.
 
 ## Architecture
 
 ```text
-Dashboard / run_fifo_demo
+Dashboard / run_uploaded_inputs
   → create fresh Run
   → LoadInputsWalker … ReverifyAndRenderWalker
       → ToolResult adapters (mock or Icarus)

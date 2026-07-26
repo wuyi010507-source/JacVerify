@@ -4,9 +4,10 @@ import from jacverify.store {
     DemoRunResult,
     TransitionView,
     UploadPreview,
-    preview_upload,
+    preview_curated_inputs,
+    preview_uploaded_inputs,
     run_fifo_demo,
-    run_uploaded_design,
+    run_uploaded_inputs,
 }
 
 cl {

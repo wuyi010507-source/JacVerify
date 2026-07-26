@@ -130,7 +130,7 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert first_run.llm_mode == "mock";
     assert first_run.requirement_count == 5;
     assert first_run.compile_status == "PASSED";
-    assert first_run.smoke_status == "PASSED";
+    assert first_run.smoke_status == "NOT_RUN";
     assert first_run.regression_status == "VERIFICATION_FAILED";
     assert first_run.reverify_status == "PASSED";
     assert first_run.failure_kind == "WRAP_MISMATCH";
@@ -141,6 +141,11 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert first_run.max_debug_attempts == 3;
     assert first_run.selected_hypothesis_rank == 1;
     assert not first_run.needs_user_review;
+    assert first_run.uploaded_test_filename == "tb_wrap.sv";
+    assert first_run.coverage_available;
+    assert first_run.code_coverage == 91.0;
+    assert first_run.functional_coverage == 100.0;
+    assert first_run.coverage_source == "mock:testbench_marker";
     assert first_run.candidate_applied;
     assert first_run.tool_evidence_available;
     assert "WRAP_MISMATCH" in first_run.regression_output;
@@ -170,7 +175,12 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     run = runs[0];
     assert len([run ->:OwnsRequirement:->]) == 5;
     assert len([run ->:OwnsModule:->]) == 1;
-    assert len([run ->:Executes:->]) == 2;
+    executed_tests: list[Test] = [run ->:Executes:->];
+    assert len(executed_tests) == 1;
+    assert executed_tests[0].name == "tb_wrap";
+    assert executed_tests[0].coverage_available;
+    assert executed_tests[0].code_coverage == 72.5;
+    assert executed_tests[0].functional_coverage == 66.7;
     assert len([run ->:FailedWith:->]) == 1;
     failure = [run ->:FailedWith:->][0];
     hyps = [failure ->:Motivates:->];
@@ -269,14 +279,32 @@ test "dashboard endpoint still returns project recommendations" {
     assert len(dashboard.recommendations) == 3;
 }
 
-test "upload path accepts curated FIFO content and rejects unknown RTL" {
+test "upload path runs an independent design and test pair" {
     workspace = os.getcwd();
     buggy = read_text_file(
         os.path.join(workspace, "demo", "fifo", "fifo_buggy.sv")
     );
-    preview = preview_upload("uploaded_fifo.sv", buggy);
-    accepted = run_uploaded_design("uploaded_fifo.sv", buggy);
-    rejected = run_uploaded_design("random.sv", "module nope; endmodule\n");
+    testbench = read_text_file(
+        os.path.join(workspace, "demo", "fifo", "tb_wrap.sv")
+    );
+    preview = preview_uploaded_inputs(
+        "uploaded_fifo.sv",
+        buggy,
+        "uploaded_tb.sv",
+        testbench
+    );
+    accepted = run_uploaded_inputs(
+        "uploaded_fifo.sv",
+        buggy,
+        "uploaded_tb.sv",
+        testbench
+    );
+    rejected = run_uploaded_inputs(
+        "random.sv",
+        "module nope; endmodule\n",
+        "empty_test.sv",
+        ""
+    );
 
     assert preview.accepted;
     assert preview.case_id == "fifo";
@@ -284,7 +312,27 @@ test "upload path accepts curated FIFO content and rejects unknown RTL" {
     assert accepted.upload_accepted;
     assert accepted.case_id == "fifo";
     assert accepted.uploaded_filename == "uploaded_fifo.sv";
+    assert accepted.uploaded_test_filename == "uploaded_tb.sv";
     assert rejected.status == "blocked";
     assert not rejected.upload_accepted;
-    assert "curated" in rejected.stop_reason or "Curated" in rejected.stop_reason;
+    assert "testbench" in rejected.stop_reason;
+}
+
+test "unrecognized design and test pair never receives the FIFO fix" {
+    result = run_uploaded_inputs(
+        "adder.sv",
+        "module adder; endmodule\n",
+        "adder_check.sv",
+        "module adder_check; initial $finish; endmodule\n"
+    );
+
+    assert result.upload_accepted;
+    assert result.case_id == "uploaded";
+    assert result.uploaded_filename == "adder.sv";
+    assert result.uploaded_test_filename == "adder_check.sv";
+    assert result.current_state == "NEEDS_USER_REVIEW";
+    assert result.needs_user_review;
+    assert result.debug_attempt == 0;
+    assert not result.candidate_applied;
+    assert "no reviewed candidate fixture" in result.stop_reason;
 }
