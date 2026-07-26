@@ -228,8 +228,10 @@ def:pub Dashboard -> JsxElement {
                         <div className="empty-icon">⬆</div>
                         <h3>Upload a design and specification to begin</h3>
                         <p>
-                            The current prototype generates a hardcoded FIFO testbench. For the
-                            matching example, click <strong>Use curated sample</strong>.
+                            Upload a design + spec pair. Curated fixtures:
+                            <code>demo/fifo</code>, <code>demo/alu</code>,
+                            <code>demo/shift_reg</code>. Or click
+                            <strong>Use curated sample</strong> for the FIFO pair.
                         </p>
                     </div>
                 } else {

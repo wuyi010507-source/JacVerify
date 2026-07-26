@@ -10,10 +10,12 @@ import from jacverify.tool_adapter {
     ToolResult,
     UploadMatch,
     UploadedInputPaths,
+    allowlisted_candidate_path,
     coverage_from_result,
     fresh_run_id,
     generate_artifact,
     identify_uploaded_inputs,
+    is_curated_case_id,
     lint_compile,
     llm_backend,
     llm_mode,
@@ -26,6 +28,7 @@ import from jacverify.tool_adapter {
     rank_hypotheses,
     run_reverify,
     run_uploaded_test,
+    set_active_case,
     tools_mode
 }
 import from jacverify.llm_calls {
@@ -776,6 +779,12 @@ def run_case_pipeline(
     spec_content: str
 ) -> DemoRunResult {
     workspace_root = os.getcwd();
+    if is_curated_case_id(case_id) {
+        set_active_case(case_id);
+    } else {
+        # Generic uploads keep the FIFO prototype tooling defaults.
+        set_active_case("fifo");
+    }
     run_id = new_run_id();
     output_dir = os.path.join(workspace_root, "runs", run_id);
     inputs: UploadedInputPaths = materialize_uploaded_inputs(
@@ -807,7 +816,7 @@ def run_case_pipeline(
         module_name=inputs.design_module,
         module_path=inputs.design_path,
         testbench_name=inputs.test_module,
-        reviewed_candidate_available=case_id == "fifo"
+        reviewed_candidate_available=is_curated_case_id(case_id)
     );
 
     root spawn LoadInputsWalker(run_id=run_id);
@@ -929,14 +938,15 @@ def generate_artifact_for_run(
         next_action=hypothesis.next_action
     );
     proposal: ArtifactProposalOutput = propose_fifo_artifact(context, top);
+    candidate = allowlisted_candidate_path();
     return make_artifact_draft(
         kind="llm_reviewed_candidate_proposal",
         description=(
             f"{proposal.description} Verification goal: "
             f"{proposal.verification_goal}"
         ),
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        candidate_path=candidate,
+        candidate_label="allowlisted_fixture:" + os.path.basename(candidate),
         hypothesis_claim=hypothesis.claim,
         notes=(
             f"{proposal.rationale} The model cannot choose or write the RTL "
@@ -1957,8 +1967,10 @@ def:pub preview_uploaded_inputs(
         spec_filename=upload_match.spec_filename,
         generated_test_filename=upload_match.generated_test_filename,
         curated_hint=(
-            "Prototype mode generates the FIFO wraparound testbench from the "
-            "uploaded spec. Automatic repair remains limited to reviewed fixtures."
+            "Curated fixtures: demo/fifo, demo/alu, demo/shift_reg. "
+            "Matched curated pairs inject their directed testbench; other "
+            "uploads use the prototype FIFO wrap TB. Automatic repair remains "
+            "limited to reviewed fixtures."
         )
     );
 }

@@ -25,11 +25,119 @@ MISMATCH_RE = re.compile(
     r"(WRAP_MISMATCH|ALU_MISMATCH|SHIFT_MISMATCH)\s+"
     r"expected=([0-9A-Fa-fxX]+)\s+observed=([0-9A-Fa-fxX]+)"
 )
+WRAP_MISMATCH_RE = MISMATCH_RE  # backward-compatible alias
 COVERAGE_RE = re.compile(
     r"JACVERIFY_COVERAGE\s+code=([0-9]+(?:\.[0-9]+)?)"
     r"\s+functional=([0-9]+(?:\.[0-9]+)?)"
 )
 MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
+
+_ACTIVE_CASE_ID = "fifo"
+
+
+@dataclass(frozen=True)
+class CaseConfig:
+    case_id: str
+    title: str
+    description: str
+    module_name: str
+    demo_dir: str
+    buggy_name: str
+    fixed_name: str
+    smoke_tb: str
+    directed_tb: str
+    spec_name: str
+    accepted_filenames: tuple[str, ...]
+    fail_tag: str
+    pass_tag: str
+    mock_fail_stdout: str
+    mock_pass_stdout: str
+
+
+CASE_CONFIGS: dict[str, CaseConfig] = {
+    "fifo": CaseConfig(
+        case_id="fifo",
+        title="FIFO wraparound",
+        description=(
+            "Module-level FIFO with a planted write-pointer wrap bug."
+        ),
+        module_name="fifo",
+        demo_dir="fifo",
+        buggy_name="fifo_buggy.sv",
+        fixed_name="fifo_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_wrap.sv",
+        spec_name="fifo_spec.md",
+        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
+        fail_tag="WRAP_MISMATCH",
+        pass_tag="WRAP_TEST_PASS",
+        mock_fail_stdout="WRAP_MISMATCH expected=55 observed=33\n",
+        mock_pass_stdout="WRAP_TEST_PASS\n",
+    ),
+    "alu": CaseConfig(
+        case_id="alu",
+        title="ALU subtract opcode",
+        description=(
+            "Small ALU where SUB incorrectly adds instead of subtracts."
+        ),
+        module_name="alu",
+        demo_dir="alu",
+        buggy_name="alu_buggy.sv",
+        fixed_name="alu_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="alu_spec.md",
+        accepted_filenames=("alu_buggy.sv", "alu.sv"),
+        fail_tag="ALU_MISMATCH",
+        pass_tag="ALU_TEST_PASS",
+        mock_fail_stdout="ALU_MISMATCH expected=05 observed=0b\n",
+        mock_pass_stdout="ALU_TEST_PASS\n",
+    ),
+    "shift_reg": CaseConfig(
+        case_id="shift_reg",
+        title="Shift-register direction",
+        description=(
+            "Shift register that shifts left instead of the specified right shift."
+        ),
+        module_name="shift_reg",
+        demo_dir="shift_reg",
+        buggy_name="shift_reg_buggy.sv",
+        fixed_name="shift_reg_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="shift_reg_spec.md",
+        accepted_filenames=("shift_reg_buggy.sv", "shift_reg.sv"),
+        fail_tag="SHIFT_MISMATCH",
+        pass_tag="SHIFT_TEST_PASS",
+        mock_fail_stdout="SHIFT_MISMATCH expected=40 observed=00\n",
+        mock_pass_stdout="SHIFT_TEST_PASS\n",
+    ),
+}
+
+
+def set_active_case(case_id: str) -> str:
+    global _ACTIVE_CASE_ID
+    if case_id not in CASE_CONFIGS:
+        raise ValueError(f"Unknown curated case_id: {case_id}")
+    _ACTIVE_CASE_ID = case_id
+    return case_id
+
+
+def get_active_case_id() -> str:
+    return _ACTIVE_CASE_ID
+
+
+def active_case() -> CaseConfig:
+    return CASE_CONFIGS[_ACTIVE_CASE_ID]
+
+
+def is_curated_case_id(case_id: str) -> bool:
+    return case_id in CASE_CONFIGS
+
+
+def allowlisted_candidate_path(case_id: str = "") -> str:
+    cfg = CASE_CONFIGS[case_id] if case_id in CASE_CONFIGS else active_case()
+    return f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
 
 
 @dataclass(frozen=True)
@@ -171,11 +279,12 @@ def _fifo_paths(workspace_root: str) -> dict[str, Path]:
 
 
 def load_spec(workspace_root: str) -> SpecLoadResult:
-    paths = _fifo_paths(workspace_root)
+    cfg = active_case()
+    paths = _case_paths(workspace_root, cfg)
     return load_uploaded_spec(
         str(paths["spec_path"]),
         str(paths["buggy_rtl"]),
-        "fifo",
+        cfg.module_name,
     )
 
 
@@ -227,12 +336,12 @@ def load_uploaded_spec(
 
 
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
-    match = WRAP_MISMATCH_RE.search(result.stdout or "")
+    match = MISMATCH_RE.search(result.stdout or "")
     if match:
         return FailureEvidence(
-            kind="WRAP_MISMATCH",
-            expected=match.group(1),
-            observed=match.group(2),
+            kind=match.group(1),
+            expected=match.group(2),
+            observed=match.group(3),
             cycle=None,
             raw_stdout=result.stdout,
             source_result=result,
@@ -355,10 +464,6 @@ def _mock_smoke() -> ToolResult:
 def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
     cfg = active_case()
     if reproduce_bug:
-        stdout = (
-            "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
-            "WRAP_MISMATCH expected=55 observed=33\n"
-        )
         return ToolResult(
             tool="vvp",
             mode="mock",
@@ -366,7 +471,10 @@ def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
             exit_code=1,
             command=["mock:vvp", "directed_regression.vvp"],
             duration_ms=2,
-            stdout=cfg.mock_fail_stdout,
+            stdout=(
+                "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
+                + cfg.mock_fail_stdout
+            ),
             stderr="",
             artifacts=["mock:directed_regression.vvp"],
             diagnostics={
@@ -384,7 +492,7 @@ def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
         duration_ms=2,
         stdout=(
             "JACVERIFY_COVERAGE code=88.0 functional=100.0\n"
-            "WRAP_TEST_PASS\n"
+            + cfg.mock_pass_stdout
         ),
         stderr="",
         artifacts=["mock:directed_regression.vvp"],
@@ -398,7 +506,7 @@ def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
 
 def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
     cfg = active_case()
-    candidate = f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
+    candidate = allowlisted_candidate_path(cfg.case_id)
     if pass_result:
         return ToolResult(
             tool="vvp",
@@ -409,7 +517,7 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
             duration_ms=2,
             stdout=(
                 "JACVERIFY_COVERAGE code=91.0 functional=100.0\n"
-                "WRAP_TEST_PASS\n"
+                + cfg.mock_pass_stdout
             ),
             stderr="",
             artifacts=["mock:patched_reverify.vvp"],
@@ -429,7 +537,7 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
         duration_ms=2,
         stdout=(
             "JACVERIFY_COVERAGE code=78.0 functional=66.7\n"
-            "WRAP_MISMATCH expected=55 observed=33\n"
+            + cfg.mock_fail_stdout
         ),
         stderr="",
         artifacts=["mock:patched_reverify.vvp"],
@@ -515,6 +623,27 @@ def _module_name(source: str, label: str) -> str:
     return match.group(1)
 
 
+def _match_curated_config(
+    workspace_root: str,
+    design_content: str,
+    spec_content: str,
+) -> CaseConfig | None:
+    design_fp = source_fingerprint(design_content)
+    spec_fp = source_fingerprint(spec_content)
+    root = Path(workspace_root).resolve()
+    for cfg in CASE_CONFIGS.values():
+        design_path = root / "demo" / cfg.demo_dir / cfg.buggy_name
+        spec_path = root / "demo" / cfg.demo_dir / cfg.spec_name
+        if not design_path.is_file() or not spec_path.is_file():
+            continue
+        if (
+            design_fp == source_fingerprint(design_path.read_text(encoding="utf-8"))
+            and spec_fp == source_fingerprint(spec_path.read_text(encoding="utf-8"))
+        ):
+            return cfg
+    return None
+
+
 def materialize_uploaded_inputs(
     workspace_root: str,
     output_dir: str,
@@ -523,20 +652,25 @@ def materialize_uploaded_inputs(
     spec_filename: str,
     spec_content: str,
 ) -> UploadedInputPaths:
-    """Write design/spec inputs and inject the prototype generated testbench."""
+    """Write design/spec inputs and inject a generated/curated testbench."""
     inputs_dir = _ensure_output_dir(output_dir) / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     design_name = _safe_upload_name(design_filename, "design.sv")
     spec_name = _safe_upload_name(spec_filename, "spec.md")
-    test_name = "generated_tb_wrap.sv"
+    matched = _match_curated_config(workspace_root, design_content, spec_content)
+    if matched is not None:
+        tb_source = _case_paths(workspace_root, matched)["wrap_tb"]
+        test_name = f"generated_{matched.directed_tb}"
+    else:
+        # Generic uploads still use the FIFO wrap TB as the prototype generator.
+        tb_source = _fifo_paths(workspace_root)["wrap_tb"]
+        test_name = "generated_tb_wrap.sv"
     design_path = inputs_dir / design_name
     spec_path = inputs_dir / spec_name
     test_path = inputs_dir / test_name
     normalized_design = normalize_source(design_content)
     normalized_spec = normalize_source(spec_content)
-    normalized_test = normalize_source(
-        _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
-    )
+    normalized_test = normalize_source(tb_source.read_text(encoding="utf-8"))
     design_path.write_text(normalized_design, encoding="utf-8")
     spec_path.write_text(normalized_spec, encoding="utf-8")
     test_path.write_text(normalized_test, encoding="utf-8")
@@ -575,10 +709,11 @@ def lint_compile(
     testbench = Path(test_path).resolve() if test_path else None
     artifacts = _ensure_output_dir(output_dir)
     command = ["iverilog", "-g2012", "-tnull"]
-    if top_module:
-        command.extend(["-s", top_module])
+    top = top_module or active_case().module_name
+    if top_module or not testbench:
+        command.extend(["-s", top])
     else:
-        command.extend(["-s", "fifo"])
+        command.extend(["-s", testbench.stem])
     command.append(str(rtl))
     if testbench is not None:
         command.append(str(testbench))
@@ -590,7 +725,7 @@ def lint_compile(
             "stage": "compile",
             "design": str(rtl),
             "test": str(testbench) if testbench is not None else "",
-            "top": top_module or "fifo",
+            "top": top_module or (testbench.stem if testbench else top),
         },
     )
     if result.status == STATUS_PASSED:
@@ -683,7 +818,7 @@ def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
     cfg = active_case()
     if tools_mode() == "mock":
         return _mock_smoke()
-    paths = _fifo_paths(workspace_root) if not candidate_path or not test_path else {}
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="smoke",
@@ -882,7 +1017,8 @@ def run_reverify(
             )
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
-    paths = _fifo_paths(workspace_root)
+    cfg = active_case()
+    paths = _case_paths(workspace_root, cfg)
     candidate = (
         Path(candidate_path).resolve()
         if candidate_path and Path(candidate_path).is_absolute()
@@ -910,8 +1046,11 @@ def run_reverify(
         "candidate": str(candidate),
         "candidate_kind": "reviewed_fixture",
         "test": str(testbench),
+        "case_id": cfg.case_id,
     }
-    if result.status == STATUS_PASSED and cfg.pass_tag in result.stdout:
+    if result.status == STATUS_PASSED and (
+        cfg.pass_tag in result.stdout or result.exit_code == 0
+    ):
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -924,7 +1063,7 @@ def run_reverify(
             artifacts=result.artifacts,
             diagnostics=diagnostics,
         )
-    if cfg.fail_tag in result.stdout:
+    if cfg.fail_tag in result.stdout or MISMATCH_RE.search(result.stdout or ""):
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -1326,11 +1465,12 @@ def generate_artifact_firecrawl(
         or not rationale
     ):
         raise RuntimeError("Firecrawl returned an invalid artifact proposal")
+    candidate = allowlisted_candidate_path()
     return ArtifactDraft(
         kind=f"firecrawl_{kind}",
         description=f"{description} Verification goal: {verification_goal}",
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        candidate_path=candidate,
+        candidate_label=f"allowlisted_fixture:{Path(candidate).name}",
         hypothesis_claim=hypothesis.claim,
         notes=(
             f"{rationale} Firecrawl cannot choose or write the RTL path; "
@@ -1461,11 +1601,12 @@ CURATED_CASES: tuple[CuratedCase, ...] = tuple(
             f"{cfg.description} Hackathon demo uses a reviewed fix fixture "
             "for re-verification."
         ),
-        buggy_relpath="demo/fifo/fifo_buggy.sv",
-        spec_relpath="demo/fifo/fifo_spec.md",
-        test_relpath="demo/fifo/tb_wrap.sv",
-        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
-    ),
+        buggy_relpath=f"demo/{cfg.demo_dir}/{cfg.buggy_name}",
+        spec_relpath=f"demo/{cfg.demo_dir}/{cfg.spec_name}",
+        test_relpath=f"demo/{cfg.demo_dir}/{cfg.directed_tb}",
+        accepted_filenames=cfg.accepted_filenames,
+    )
+    for cfg in CASE_CONFIGS.values()
 )
 
 
@@ -1602,11 +1743,12 @@ def identify_uploaded_inputs(
                 case_title=case.title,
                 message=(
                     f"Ready: `{design_basename}` and `{spec_basename}` match "
-                    "the reviewed FIFO fixture. JacVerify will generate the "
-                    "prototype wraparound testbench."
+                    f"curated case `{case.title}`. JacVerify will inject the "
+                    "reviewed directed testbench for this case."
                 ),
                 filename=design_basename,
                 spec_filename=spec_basename,
+                generated_test_filename=f"generated_{Path(case.test_relpath).name}",
             )
 
     return UploadMatch(
@@ -1634,11 +1776,23 @@ def load_curated_case_upload(
     for case in CURATED_CASES:
         if case.case_id != case_id:
             continue
-        text = _case_buggy_text(workspace_root, case)
-        return identify_uploaded_case(
+        root = Path(workspace_root).resolve()
+        design = (root / case.buggy_relpath).read_text(encoding="utf-8")
+        spec = (root / case.spec_relpath).read_text(encoding="utf-8")
+        # Preserve design-only helper used by older tests when only RTL is needed.
+        design_only = identify_uploaded_case(
             workspace_root,
             Path(case.buggy_relpath).name,
-            text,
+            design,
+        )
+        if design_only.accepted:
+            return design_only
+        return identify_uploaded_inputs(
+            workspace_root,
+            Path(case.buggy_relpath).name,
+            design,
+            Path(case.spec_relpath).name,
+            spec,
         )
     return UploadMatch(
         accepted=False,
