@@ -121,10 +121,6 @@ main {
 
 .hero {
   padding: 72px 0 48px;
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr);
-  align-items: end;
-  gap: 60px;
 }
 
 .workflow-intro {
@@ -243,8 +239,7 @@ h1 {
 }
 
 .project-heading,
-.section-title-row,
-.task-hero {
+.section-title-row {
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
@@ -252,15 +247,13 @@ h1 {
 }
 
 .project-heading h2,
-.section-title-row h2,
-.task-hero h2 {
+.section-title-row h2 {
   font-size: 30px;
   letter-spacing: -0.025em;
   margin: 0 0 6px;
 }
 
-.project-heading p,
-.task-hero p {
+.project-heading p {
   color: var(--muted);
   margin: 0;
 }
@@ -462,18 +455,27 @@ h1 {
 }
 
 .task-hero {
-  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 36px 28px;
+  text-align: center;
   border: 1px solid var(--line);
   background: linear-gradient(120deg, rgba(10, 36, 20, 0.95), rgba(10, 20, 14, 0.82));
 }
 
 .task-hero p {
-  max-width: 760px;
+  max-width: 640px;
+  margin: 0;
+  color: var(--muted);
   line-height: 1.6;
+  font-size: 17px;
 }
 
 .run-button {
-  padding: 14px 18px;
+  padding: 14px 22px;
   white-space: nowrap;
 }
 
@@ -776,6 +778,12 @@ h1 {
   gap: 14px;
 }
 
+.evidence-heading h3 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+}
+
 .evidence-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -908,11 +916,128 @@ h1 {
   gap: 0;
 }
 
+.timeline-fold {
+  border: 1px solid var(--line);
+  background: rgba(6, 18, 11, 0.72);
+  overflow: hidden;
+}
+
+.timeline-fold.is-live {
+  border-color: rgba(45, 255, 106, 0.42);
+  box-shadow: 0 0 28px rgba(45, 255, 106, 0.08);
+}
+
+.timeline-fold-toggle {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  padding: 18px 20px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.timeline-fold-toggle h3 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+}
+
+.timeline-fold-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #8fad9a;
+  font: 11px/1 "DM Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.timeline-fold-chevron {
+  color: var(--neon);
+}
+
+.timeline-fold .timeline {
+  padding: 0 20px 18px;
+}
+
 .timeline-item {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr);
   gap: 18px;
   position: relative;
+  animation: timeline-arrive 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.timeline-item.is-streaming .timeline-card {
+  border-color: rgba(45, 255, 106, 0.55);
+  box-shadow: 0 0 24px rgba(45, 255, 106, 0.12);
+}
+
+.timeline-stream-cursor,
+.timeline-empty,
+.timeline-processing {
+  margin: 4px 0 0 66px;
+  color: #8fad9a;
+  font: 12px/1.5 "DM Mono", monospace;
+}
+
+.timeline-processing {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 20px 18px;
+  padding: 12px 14px;
+  border: 1px dashed rgba(45, 255, 106, 0.28);
+  background: rgba(45, 255, 106, 0.04);
+}
+
+.timeline-processing-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--neon);
+  box-shadow: 0 0 12px rgba(45, 255, 106, 0.55);
+  animation: timeline-caret 900ms steps(1) infinite;
+  flex-shrink: 0;
+}
+
+.timeline-stream-cursor::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 4px;
+  vertical-align: text-bottom;
+  background: var(--neon);
+  animation: timeline-caret 900ms steps(1) infinite;
+}
+
+@keyframes timeline-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes timeline-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
 }
 
 .timeline-item:not(:last-child)::before {
@@ -1233,10 +1358,13 @@ h1 {
 
   .project-heading,
   .section-title-row,
-  .task-hero,
   .tool-proof-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .task-hero {
+    align-items: center;
   }
 
   .recommendation {

@@ -1975,7 +1975,7 @@ def make_artifact_draft(
     )
 
 
-def fresh_run_id(prefix: str = "fifo-run") -> str:
+def fresh_run_id(prefix: str = "session") -> str:
     return f"{prefix}-{int(time.time() * 1000)}"
 
 

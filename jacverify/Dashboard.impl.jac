@@ -8,6 +8,7 @@ impl Dashboard.run_demo {
         return;
     }
     workflow_started = True;
+    timeline_open = False;
     running = True;
     error_message = "";
     try {
@@ -23,7 +24,7 @@ impl Dashboard.run_demo {
         );
         demo_run = result;
         while result.status == "running" {
-            await wait_for_next_poll(1000);
+            await wait_for_next_poll(450);
             result = await advance_verification(result.job_id);
             demo_run = result;
         }
@@ -38,6 +39,7 @@ impl Dashboard.run_demo {
 
 impl Dashboard.use_curated_sample {
     workflow_started = True;
+    timeline_open = False;
     running = True;
     error_message = "";
     reading_upload = False;
@@ -47,7 +49,7 @@ impl Dashboard.use_curated_sample {
         preview: UploadPreview = await preview_curated_inputs();
         demo_run = result;
         while result.status == "running" {
-            await wait_for_next_poll(1000);
+            await wait_for_next_poll(450);
             result = await advance_verification(result.job_id);
             demo_run = result;
         }
@@ -159,6 +161,7 @@ impl Dashboard.clear_design(_e: MouseEvent) {
     error_message = "";
     curated_session = False;
     workflow_started = False;
+    timeline_open = False;
 }
 
 impl Dashboard.clear_spec(_e: MouseEvent) {
@@ -169,4 +172,9 @@ impl Dashboard.clear_spec(_e: MouseEvent) {
     error_message = "";
     curated_session = False;
     workflow_started = False;
+    timeline_open = False;
+}
+
+impl Dashboard.toggle_timeline(_e: MouseEvent) {
+    timeline_open = not timeline_open;
 }

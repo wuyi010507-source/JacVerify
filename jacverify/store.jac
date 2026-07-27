@@ -630,7 +630,7 @@ def plan_transition(current_state: str) -> PlannedTransition {
 # ---------------------------------------------------------------------------
 
 def new_run_id() -> str {
-    return fresh_run_id("fifo-run");
+    return fresh_run_id("session");
 }
 
 def append_transition(

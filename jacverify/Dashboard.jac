@@ -100,7 +100,8 @@ def:pub Dashboard -> JsxElement {
         upload_preview: UploadPreview | None = None,
         reading_upload: bool = False,
         curated_session: bool = False,
-        workflow_started: bool = False;
+        workflow_started: bool = False,
+        timeline_open: bool = False;
 
     async def run_demo;
     async def use_curated_sample;
@@ -108,6 +109,7 @@ def:pub Dashboard -> JsxElement {
     async def on_spec_file_change(e: any);
     def clear_design(_e: MouseEvent);
     def clear_spec(_e: MouseEvent);
+    def toggle_timeline(_e: MouseEvent);
 
     return <div className="app-shell">
         <header className="topbar">
@@ -131,17 +133,6 @@ def:pub Dashboard -> JsxElement {
                 <div>
                     <div className="eyebrow">VERIFICATION WORKFLOW</div>
                     <h1>Upload a design. Prove it with evidence.</h1>
-                    <p className="hero-copy">
-                        Jac walkers drive compile, simulation, failure structuring, hypothesis
-                        ranking, candidate application, and re-verification—then leave a
-                        requirement-to-evidence graph you can inspect.
-                    </p>
-                </div>
-                <div className="hero-proof">
-                    <div className="proof-label">JAC AT THE CENTER</div>
-                    <div className="proof-flow">
-                        Upload <span>→</span> Walkers <span>→</span> Evidence <span>→</span> Reverify
-                    </div>
                 </div>
             </section>
 
@@ -151,14 +142,10 @@ def:pub Dashboard -> JsxElement {
 
             <section className="view-stack">
                 <div className={"task-hero workflow-intro " + ("is-collapsed" if workflow_started else "")}>
-                    <div>
-                        <div className="eyebrow">EIGHT-WALKER EVIDENCE LOOP</div>
-                        <h2>Verify a design from its specification</h2>
-                        <p>
-                            Upload RTL and its requirements. JacVerify generates a testbench,
-                            runs it, and records tool evidence and coverage.
-                        </p>
-                    </div>
+                    <p>
+                        Upload RTL and its requirements. JacVerify generates a testbench,
+                        runs it, and records tool evidence and coverage.
+                    </p>
                     <button
                         className="run-button"
                         onClick={run_demo}
@@ -261,32 +248,12 @@ def:pub Dashboard -> JsxElement {
                             Clear spec
                         </button>
                     </div>
-                    {if upload_preview is not None {
-                        <div className={"upload-status " + ("ok" if upload_preview.accepted else "blocked")}>
-                            <strong>
-                                {
-                                    "INPUT PAIR READY · " + upload_preview.case_title
-                                    if upload_preview.accepted
-                                    else "INPUT PAIR INCOMPLETE"
-                                }
-                            </strong>
-                            <p>{upload_preview.message}</p>
-                            <small>{upload_preview.curated_hint}</small>
-                        </div>
-                    }}
                 </div>
 
                 {if demo_run is None {
                     <div className="empty-demo">
                         <div className="empty-icon">⬆</div>
                         <h3>Upload a design and specification to begin</h3>
-                        <p>
-                            JacVerify generates the testbench in hardcoded or AI mode.
-                            Curated fixtures:
-                            <code>demo/fifo</code>, <code>demo/alu</code>,
-                            <code>demo/shift_reg</code>. Or click
-                            <strong>Use curated sample</strong> for the FIFO pair.
-                        </p>
                     </div>
                 } else {
                     if demo_run.status == "running" {
@@ -322,9 +289,182 @@ def:pub Dashboard -> JsxElement {
                             </small>
                         </div>
                     }
+
+                    <section className={"timeline-fold " + ("is-live" if demo_run.status == "running" else "")}>
+                        <button
+                            type="button"
+                            className="timeline-fold-toggle"
+                            onClick={toggle_timeline}
+                        >
+                            <div>
+                                <div className="eyebrow">EVIDENCE TRACE</div>
+                                <h3>
+                                    {
+                                        "Walker transitions"
+                                        if timeline_open
+                                        else (
+                                            "Processing verification steps…"
+                                            if demo_run.status == "running"
+                                            else "Walker transition history"
+                                        )
+                                    }
+                                </h3>
+                            </div>
+                            <div className="timeline-fold-meta">
+                                <span>
+                                    {
+                                        (
+                                            "PROCESSING · "
+                                            + str(len(demo_run.transitions))
+                                            + " STEPS"
+                                        )
+                                        if demo_run.status == "running" and not timeline_open
+                                        else (
+                                            str(len(demo_run.transitions))
+                                            + " STEPS"
+                                            + (
+                                                " · LIVE"
+                                                if demo_run.status == "running"
+                                                else ""
+                                            )
+                                        )
+                                    }
+                                </span>
+                                <span className="timeline-fold-chevron">
+                                    {"▴" if timeline_open else "▾"}
+                                </span>
+                            </div>
+                        </button>
+                        {if not timeline_open and demo_run.status == "running" {
+                            <div className="timeline-processing">
+                                <span className="timeline-processing-dot"></span>
+                                Processing · expand to watch the live evidence stream
+                            </div>
+                        }}
+                        {if timeline_open {
+                            <div className="timeline">
+                                {for transition in demo_run.transitions {
+                                    <article
+                                        key={transition.sequence}
+                                        className={
+                                            "timeline-item"
+                                            + (
+                                                " is-streaming"
+                                                if (
+                                                    demo_run.status == "running"
+                                                    and transition.sequence
+                                                        == len(demo_run.transitions)
+                                                )
+                                                else ""
+                                            )
+                                        }
+                                    >
+                                        <div className="timeline-index">{transition.sequence}</div>
+                                        <div className="timeline-card">
+                                            <div className="timeline-meta">
+                                                <span>{transition.from_state}</span>
+                                                <span className="arrow">→</span>
+                                                <strong>{transition.to_state}</strong>
+                                                <EvidenceBadge evidence_kind={transition.evidence_kind} />
+                                                {if transition.walker_name {
+                                                    <span className="evidence-chip">{transition.walker_name}</span>
+                                                }}
+                                            </div>
+                                            <h3>{transition.event}</h3>
+                                            <p>{transition.summary}</p>
+                                            <div className="evidence-row">
+                                                {for evidence_id in transition.evidence_ids {
+                                                    <span key={evidence_id} className="evidence-chip">{evidence_id}</span>
+                                                }}
+                                            </div>
+                                            {if transition.code_change_content {
+                                                <details className="code-change-details">
+                                                    <summary>
+                                                        <span>View code change</span>
+                                                        <span className="code-change-chevron">⌄</span>
+                                                    </summary>
+                                                    <div className="code-change-panel">
+                                                        <div className="code-change-title">
+                                                            {transition.code_change_title}
+                                                        </div>
+                                                        <pre><code>{transition.code_change_content}</code></pre>
+                                                    </div>
+                                                </details>
+                                            }}
+                                        </div>
+                                    </article>
+                                }}
+                                {if demo_run.status == "running" {
+                                    <div className="timeline-stream-cursor">
+                                        Waiting for next walker…
+                                    </div>
+                                }}
+                                {if (
+                                    demo_run.status != "running"
+                                    and len(demo_run.transitions) == 0
+                                ) {
+                                    <div className="timeline-empty">No transitions recorded.</div>
+                                }}
+                            </div>
+                        }}
+                    </section>
+
+                    if demo_run.status != "running" {
+                        <div className="coverage-panel">
+                            <div className="coverage-heading">
+                                <div>
+                                    <div className="eyebrow">LATEST VALIDATION COVERAGE</div>
+                                    <h3>Coverage reported by the generated test flow</h3>
+                                </div>
+                            </div>
+                            <div className="coverage-grid">
+                                <div className="coverage-card">
+                                    <div>
+                                        <span>CODE COVERAGE</span>
+                                        <strong>
+                                            {
+                                                str(demo_run.code_coverage)[:5] + "%"
+                                                if demo_run.coverage_available
+                                                else "N/A"
+                                            }
+                                        </strong>
+                                    </div>
+                                    <progress
+                                        max="100"
+                                        value={
+                                            demo_run.code_coverage
+                                            if demo_run.coverage_available
+                                            else 0
+                                        }
+                                    ></progress>
+                                </div>
+                                <div className="coverage-card functional">
+                                    <div>
+                                        <span>FUNCTIONAL COVERAGE</span>
+                                        <strong>
+                                            {
+                                                str(demo_run.functional_coverage)[:5] + "%"
+                                                if demo_run.coverage_available
+                                                else "N/A"
+                                            }
+                                        </strong>
+                                    </div>
+                                    <progress
+                                        max="100"
+                                        value={
+                                            demo_run.functional_coverage
+                                            if demo_run.coverage_available
+                                            else 0
+                                        }
+                                    ></progress>
+                                </div>
+                            </div>
+                        </div>
+                    }
+
                     <div className="run-summary">
                         <div>
-                            <span>RUN</span>
+                            <span>SESSION</span>
                             <strong>{demo_run.job_id}</strong>
                         </div>
                         <div>
@@ -372,14 +512,6 @@ def:pub Dashboard -> JsxElement {
                             <strong className="done-state">{demo_run.current_state}</strong>
                         </div>
                         <div>
-                            <span>TOOL MODE</span>
-                            <strong>{demo_run.tool_mode}</strong>
-                        </div>
-                        <div>
-                            <span>LLM MODE</span>
-                            <strong>{demo_run.llm_mode}</strong>
-                        </div>
-                        <div>
                             <span>LLM JOB</span>
                             <strong>
                                 {
@@ -394,20 +526,6 @@ def:pub Dashboard -> JsxElement {
                             </strong>
                         </div>
                         <div>
-                            <span>TESTGEN MODE</span>
-                            <strong>{demo_run.test_generation_mode}</strong>
-                        </div>
-                        <div>
-                            <span>TESTGEN SOURCE</span>
-                            <strong>
-                                {
-                                    demo_run.test_generation_source
-                                    if demo_run.test_generation_source
-                                    else "pending"
-                                }
-                            </strong>
-                        </div>
-                        <div>
                             <span>DEBUG ATTEMPT</span>
                             <strong>
                                 {demo_run.debug_attempt}/{demo_run.max_debug_attempts}
@@ -415,14 +533,11 @@ def:pub Dashboard -> JsxElement {
                         </div>
                     </div>
 
-                    <div className="mode-row">
-                        <span>Walkers: {demo_run.walker_log}</span>
-                        <a className="repo-link" href={demo_run.graph_hint} target="_blank">
-                            Inspect evidence graph ↗
-                        </a>
-                    </div>
-
                     <div className="evidence-panel">
+                        <div className="evidence-heading">
+                            <div className="eyebrow">VERIFICATION OUTCOME</div>
+                            <h3>Statuses, failure, hypothesis, and candidate</h3>
+                        </div>
                         <div className="evidence-grid">
                             <div>
                                 <span>Compile</span>
@@ -469,13 +584,6 @@ def:pub Dashboard -> JsxElement {
                             <div className="artifact-box">
                                 <div className="eyebrow">ARTIFACT / REVIEWED CANDIDATE</div>
                                 <p>{demo_run.artifact_description}</p>
-                                <small>
-                                    {
-                                        "candidate applied: " + demo_run.candidate_label
-                                        if demo_run.candidate_applied
-                                        else "candidate not applied"
-                                    }
-                                </small>
                             </div>
                         }}
                         {if demo_run.stop_reason {
@@ -486,134 +594,6 @@ def:pub Dashboard -> JsxElement {
                                     else demo_run.stop_reason
                                 }
                             </div>
-                        }}
-                    </div>
-
-                    <div className="coverage-panel">
-                        <div className="coverage-heading">
-                            <div>
-                                <div className="eyebrow">LATEST VALIDATION COVERAGE</div>
-                                <h3>Coverage reported by the generated test flow</h3>
-                            </div>
-                            <span className="coverage-source">
-                                {
-                                    demo_run.coverage_source
-                                    if demo_run.coverage_available
-                                    else "not reported · N/A"
-                                }
-                            </span>
-                        </div>
-                        <div className="coverage-grid">
-                            <div className="coverage-card">
-                                <div>
-                                    <span>CODE COVERAGE</span>
-                                    <strong>
-                                        {
-                                            str(demo_run.code_coverage)[:5] + "%"
-                                            if demo_run.coverage_available
-                                            else "N/A"
-                                        }
-                                    </strong>
-                                </div>
-                                <progress
-                                    max="100"
-                                    value={
-                                        demo_run.code_coverage
-                                        if demo_run.coverage_available
-                                        else 0
-                                    }
-                                ></progress>
-                            </div>
-                            <div className="coverage-card functional">
-                                <div>
-                                    <span>FUNCTIONAL COVERAGE</span>
-                                    <strong>
-                                        {
-                                            str(demo_run.functional_coverage)[:5] + "%"
-                                            if demo_run.coverage_available
-                                            else "N/A"
-                                        }
-                                    </strong>
-                                </div>
-                                <progress
-                                    max="100"
-                                    value={
-                                        demo_run.functional_coverage
-                                        if demo_run.coverage_available
-                                        else 0
-                                    }
-                                ></progress>
-                            </div>
-                        </div>
-                        <small>
-                            Optional protocol: print
-                            <code>JACVERIFY_COVERAGE code=82.5 functional=75.0</code>
-                            from the testbench. Missing values remain N/A.
-                        </small>
-                    </div>
-
-                    <div className="tool-proof">
-                        <div className="tool-proof-heading">
-                            <div>
-                                <div className="eyebrow">TOOL EVIDENCE</div>
-                                <h3>{demo_run.toolchain}</h3>
-                                <p className="proof-subline">
-                                    {demo_run.requirement_count} requirements · status {demo_run.status}
-                                </p>
-                            </div>
-                            <span className={"proof-status ready" if demo_run.tool_evidence_available else "proof-status blocked"}>
-                                {"PIPELINE COMPLETE" if demo_run.tool_evidence_available else "PIPELINE INCOMPLETE"}
-                            </span>
-                        </div>
-                        <div className="terminal-grid">
-                            <div className="terminal">
-                                <div className="terminal-label failure-output">UPLOADED TEST · INITIAL RUN</div>
-                                <pre>{demo_run.regression_output}</pre>
-                            </div>
-                            <div className="terminal">
-                                <div className="terminal-label pass-output">OPTIONAL CANDIDATE · RE-VERIFICATION</div>
-                                <pre>{demo_run.reverify_output}</pre>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div className="timeline">
-                        {for transition in demo_run.transitions {
-                            <article key={transition.sequence} className="timeline-item">
-                                <div className="timeline-index">{transition.sequence}</div>
-                                <div className="timeline-card">
-                                    <div className="timeline-meta">
-                                        <span>{transition.from_state}</span>
-                                        <span className="arrow">→</span>
-                                        <strong>{transition.to_state}</strong>
-                                        <EvidenceBadge evidence_kind={transition.evidence_kind} />
-                                        {if transition.walker_name {
-                                            <span className="evidence-chip">{transition.walker_name}</span>
-                                        }}
-                                    </div>
-                                    <h3>{transition.event}</h3>
-                                    <p>{transition.summary}</p>
-                                    <div className="evidence-row">
-                                        {for evidence_id in transition.evidence_ids {
-                                            <span key={evidence_id} className="evidence-chip">{evidence_id}</span>
-                                        }}
-                                    </div>
-                                    {if transition.code_change_content {
-                                        <details className="code-change-details">
-                                            <summary>
-                                                <span>View code change</span>
-                                                <span className="code-change-chevron">⌄</span>
-                                            </summary>
-                                            <div className="code-change-panel">
-                                                <div className="code-change-title">
-                                                    {transition.code_change_title}
-                                                </div>
-                                                <pre><code>{transition.code_change_content}</code></pre>
-                                            </div>
-                                        </details>
-                                    }}
-                                </div>
-                            </article>
                         }}
                     </div>
 
