@@ -7,13 +7,14 @@ impl Dashboard.run_demo {
         );
         return;
     }
+    workflow_started = True;
     running = True;
     error_message = "";
     try {
         result: DemoRunResult = (
-            await run_fifo_demo()
+            await start_fifo_demo()
             if curated_session
-            else await run_uploaded_inputs(
+            else await start_uploaded_inputs(
                 design_filename,
                 design_content,
                 spec_filename,
@@ -21,7 +22,12 @@ impl Dashboard.run_demo {
             )
         );
         demo_run = result;
-        if result.status == "blocked" and not result.upload_accepted {
+        while result.status == "running" {
+            await wait_for_next_poll(1000);
+            result = await advance_verification(result.job_id);
+            demo_run = result;
+        }
+        if result.status == "blocked" {
             error_message = result.stop_reason;
         }
     } except Exception as e {
@@ -31,14 +37,20 @@ impl Dashboard.run_demo {
 }
 
 impl Dashboard.use_curated_sample {
+    workflow_started = True;
     running = True;
     error_message = "";
     reading_upload = False;
     curated_session = True;
     try {
-        result: DemoRunResult = await run_fifo_demo();
+        result: DemoRunResult = await start_fifo_demo();
         preview: UploadPreview = await preview_curated_inputs();
         demo_run = result;
+        while result.status == "running" {
+            await wait_for_next_poll(1000);
+            result = await advance_verification(result.job_id);
+            demo_run = result;
+        }
         design_filename = (
             result.uploaded_filename
             if result.uploaded_filename
@@ -66,6 +78,7 @@ impl Dashboard.on_design_file_change(e: any) {
     error_message = "";
     demo_run = None;
     curated_session = False;
+    workflow_started = False;
     try {
         file_list = e.target.files;
         if file_list is None or file_list.length == 0 {
@@ -104,6 +117,7 @@ impl Dashboard.on_spec_file_change(e: any) {
     error_message = "";
     demo_run = None;
     curated_session = False;
+    workflow_started = False;
     try {
         file_list = e.target.files;
         if file_list is None or file_list.length == 0 {
@@ -144,6 +158,7 @@ impl Dashboard.clear_design(_e: MouseEvent) {
     demo_run = None;
     error_message = "";
     curated_session = False;
+    workflow_started = False;
 }
 
 impl Dashboard.clear_spec(_e: MouseEvent) {
@@ -153,4 +168,5 @@ impl Dashboard.clear_spec(_e: MouseEvent) {
     demo_run = None;
     error_message = "";
     curated_session = False;
+    workflow_started = False;
 }

@@ -4,10 +4,12 @@ sv import from .store {
     DemoRunResult,
     TransitionView,
     UploadPreview,
+    advance_verification,
     preview_curated_inputs,
     preview_uploaded_inputs,
-    run_fifo_demo,
-    run_uploaded_inputs,
+    start_fifo_demo,
+    start_uploaded_inputs,
+    wait_for_next_poll,
 }
 
 def:pub EvidenceBadge(evidence_kind: str) -> JsxElement {
@@ -37,6 +39,56 @@ def:pub StatusLabel(status: str) -> JsxElement {
     return <span className={"status-pill " + status.lower()}>{label}</span>;
 }
 
+def:pub StageLabel(state: str) -> str {
+    if state == "S0_SPEC_INGEST" {
+        return "Loading design and specification";
+    } elif state == "S2_TEST_GENERATION" {
+        return "Generating testbench";
+    } elif state == "S3_STATIC_CHECK" {
+        return "Compiling generated test";
+    } elif state == "S4_COMPILE_ELAB" {
+        return "Running simulation";
+    } elif state == "D0_FAILURE_NORMALIZE" {
+        return "Structuring failure evidence";
+    } elif state == "D1_HYPOTHESIS_RANK" {
+        return "Ranking hypotheses with AI";
+    } elif state == "D3_GENERATE_ARTIFACT" {
+        return "Generating verification artifact";
+    } elif state == "D4_APPLY_CANDIDATE" {
+        return "Re-verifying candidate";
+    } elif state == "DONE" {
+        return "Verification complete";
+    } elif state == "NEEDS_USER_REVIEW" {
+        return "User review required";
+    } elif state == "BLOCKED" {
+        return "Verification blocked";
+    }
+    return state;
+}
+
+def:pub StagePercent(state: str) -> int {
+    if state == "S0_SPEC_INGEST" {
+        return 5;
+    } elif state == "S2_TEST_GENERATION" {
+        return 18;
+    } elif state == "S3_STATIC_CHECK" {
+        return 32;
+    } elif state == "S4_COMPILE_ELAB" {
+        return 46;
+    } elif state == "D0_FAILURE_NORMALIZE" {
+        return 60;
+    } elif state == "D1_HYPOTHESIS_RANK" {
+        return 72;
+    } elif state == "D3_GENERATE_ARTIFACT" {
+        return 84;
+    } elif state == "D4_APPLY_CANDIDATE" {
+        return 94;
+    } elif state == "DONE" {
+        return 100;
+    }
+    return 100 if state == "NEEDS_USER_REVIEW" or state == "BLOCKED" else 0;
+}
+
 def:pub Dashboard -> JsxElement {
     has demo_run: DemoRunResult | None = None,
         running: bool = False,
@@ -47,7 +99,8 @@ def:pub Dashboard -> JsxElement {
         spec_content: str = "",
         upload_preview: UploadPreview | None = None,
         reading_upload: bool = False,
-        curated_session: bool = False;
+        curated_session: bool = False,
+        workflow_started: bool = False;
 
     async def run_demo;
     async def use_curated_sample;
@@ -74,7 +127,7 @@ def:pub Dashboard -> JsxElement {
         </header>
 
         <main>
-            <section className="hero">
+            <section className={"hero workflow-intro " + ("is-collapsed" if workflow_started else "")}>
                 <div>
                     <div className="eyebrow">VERIFICATION WORKFLOW</div>
                     <h1>Upload a design. Prove it with evidence.</h1>
@@ -97,9 +150,9 @@ def:pub Dashboard -> JsxElement {
             }}
 
             <section className="view-stack">
-                <div className="task-hero">
+                <div className={"task-hero workflow-intro " + ("is-collapsed" if workflow_started else "")}>
                     <div>
-                        <div className="eyebrow">SEVEN-WALKER EVIDENCE LOOP</div>
+                        <div className="eyebrow">EIGHT-WALKER EVIDENCE LOOP</div>
                         <h2>Verify a design from its specification</h2>
                         <p>
                             Upload RTL and its requirements. JacVerify generates a testbench,
@@ -228,11 +281,47 @@ def:pub Dashboard -> JsxElement {
                         <div className="empty-icon">⬆</div>
                         <h3>Upload a design and specification to begin</h3>
                         <p>
-                            The current prototype generates a hardcoded FIFO testbench. For the
-                            matching example, click <strong>Use curated sample</strong>.
+                            JacVerify generates the testbench in hardcoded or AI mode.
+                            Curated fixtures:
+                            <code>demo/fifo</code>, <code>demo/alu</code>,
+                            <code>demo/shift_reg</code>. Or click
+                            <strong>Use curated sample</strong> for the FIFO pair.
                         </p>
                     </div>
                 } else {
+                    if demo_run.status == "running" {
+                        <div className="live-progress">
+                            <div className="live-progress-heading">
+                                <div>
+                                    <div className="eyebrow">LIVE VERIFICATION PROGRESS</div>
+                                    <h3>{StageLabel(demo_run.current_state)}</h3>
+                                </div>
+                                <strong>{StagePercent(demo_run.current_state)}%</strong>
+                            </div>
+                            <progress
+                                max="100"
+                                value={StagePercent(demo_run.current_state)}
+                            ></progress>
+                            <small>
+                                Current state: {demo_run.current_state} · completed walkers: {
+                                    len(demo_run.walker_log)
+                                }
+                                {
+                                    (
+                                        " · LLM job: "
+                                        + demo_run.llm_job_status
+                                        + " (attempt "
+                                        + str(demo_run.llm_job_attempt)
+                                        + "/"
+                                        + str(demo_run.llm_job_max_attempts)
+                                        + ")"
+                                    )
+                                    if demo_run.llm_job_kind
+                                    else ""
+                                }
+                            </small>
+                        </div>
+                    }
                     <div className="run-summary">
                         <div>
                             <span>RUN</span>
@@ -289,6 +378,34 @@ def:pub Dashboard -> JsxElement {
                         <div>
                             <span>LLM MODE</span>
                             <strong>{demo_run.llm_mode}</strong>
+                        </div>
+                        <div>
+                            <span>LLM JOB</span>
+                            <strong>
+                                {
+                                    (
+                                        demo_run.llm_job_kind
+                                        + " · "
+                                        + demo_run.llm_job_status
+                                    )
+                                    if demo_run.llm_job_kind
+                                    else "idle"
+                                }
+                            </strong>
+                        </div>
+                        <div>
+                            <span>TESTGEN MODE</span>
+                            <strong>{demo_run.test_generation_mode}</strong>
+                        </div>
+                        <div>
+                            <span>TESTGEN SOURCE</span>
+                            <strong>
+                                {
+                                    demo_run.test_generation_source
+                                    if demo_run.test_generation_source
+                                    else "pending"
+                                }
+                            </strong>
                         </div>
                         <div>
                             <span>DEBUG ATTEMPT</span>
@@ -481,10 +598,71 @@ def:pub Dashboard -> JsxElement {
                                             <span key={evidence_id} className="evidence-chip">{evidence_id}</span>
                                         }}
                                     </div>
+                                    {if transition.code_change_content {
+                                        <details className="code-change-details">
+                                            <summary>
+                                                <span>View code change</span>
+                                                <span className="code-change-chevron">⌄</span>
+                                            </summary>
+                                            <div className="code-change-panel">
+                                                <div className="code-change-title">
+                                                    {transition.code_change_title}
+                                                </div>
+                                                <pre><code>{transition.code_change_content}</code></pre>
+                                            </div>
+                                        </details>
+                                    }}
                                 </div>
                             </article>
                         }}
                     </div>
+
+                    if demo_run.status != "running" and demo_run.output_files {
+                        <section className="output-files-panel">
+                            <div className="output-files-heading">
+                                <div>
+                                    <div className="eyebrow">RUN ARTIFACTS</div>
+                                    <h3>Output Files</h3>
+                                    <p>
+                                        Generated files from this verification run.
+                                        Review the source or download a local copy.
+                                    </p>
+                                </div>
+                                <span>{len(demo_run.output_files)} FILES</span>
+                            </div>
+                            <div className="output-files-list">
+                                {for output in demo_run.output_files {
+                                    <article key={output.filename} className="output-file-card">
+                                        <div className="output-file-meta">
+                                            <div>
+                                                <span>{output.kind}</span>
+                                                <strong>{output.filename}</strong>
+                                                <small>
+                                                    {output.relative_path} · {output.size_bytes} bytes
+                                                </small>
+                                            </div>
+                                        </div>
+                                        <details className="output-file-details">
+                                            <summary>View</summary>
+                                            <div className="code-change-panel output-code-panel">
+                                                <div className="code-change-title">
+                                                    {output.filename}
+                                                </div>
+                                                <pre><code>{output.content}</code></pre>
+                                            </div>
+                                        </details>
+                                        <a
+                                            className="output-download"
+                                            href={output.download_href}
+                                            download={output.filename}
+                                        >
+                                            Download
+                                        </a>
+                                    </article>
+                                }}
+                            </div>
+                        </section>
+                    }
                 }}
             </section>
         </main>

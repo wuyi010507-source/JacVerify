@@ -1,19 +1,24 @@
-"""Allow-listed FIFO tool adapter with explicit mock/live modes."""
+"""Allow-listed curated-case tool adapter with explicit mock/live modes."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import difflib
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _load_dotenv_file(path: Path) -> None:
@@ -48,14 +53,127 @@ STATUS_TOOL_ERROR = "TOOL_ERROR"
 STATUS_BUG_NOT_REPRODUCED = "BUG_NOT_REPRODUCED"
 STATUS_NOT_RUN = "NOT_RUN"
 
-WRAP_MISMATCH_RE = re.compile(
-    r"WRAP_MISMATCH\s+expected=([0-9A-Fa-f]+)\s+observed=([0-9A-Fa-f]+)"
+MISMATCH_RE = re.compile(
+    r"(WRAP_MISMATCH|ALU_MISMATCH|SHIFT_MISMATCH)\s+"
+    r"expected=([0-9A-Fa-fxX]+)\s+observed=([0-9A-Fa-fxX]+)"
 )
+GENERIC_FAILURE_RE = re.compile(
+    r"JACVERIFY_FAILURE\s+kind=(\S+)\s+expected=(\S+)\s+observed=(\S+)"
+    r"(?:\s+cycle=(\d+))?"
+)
+WRAP_MISMATCH_RE = MISMATCH_RE  # backward-compatible alias
 COVERAGE_RE = re.compile(
     r"JACVERIFY_COVERAGE\s+code=([0-9]+(?:\.[0-9]+)?)"
     r"\s+functional=([0-9]+(?:\.[0-9]+)?)"
 )
 MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\b")
+
+_ACTIVE_CASE_ID = "fifo"
+
+
+@dataclass(frozen=True)
+class CaseConfig:
+    case_id: str
+    title: str
+    description: str
+    module_name: str
+    demo_dir: str
+    buggy_name: str
+    fixed_name: str
+    smoke_tb: str
+    directed_tb: str
+    spec_name: str
+    accepted_filenames: tuple[str, ...]
+    fail_tag: str
+    pass_tag: str
+    mock_fail_stdout: str
+    mock_pass_stdout: str
+
+
+CASE_CONFIGS: dict[str, CaseConfig] = {
+    "fifo": CaseConfig(
+        case_id="fifo",
+        title="FIFO wraparound",
+        description=(
+            "Module-level FIFO with a planted write-pointer wrap bug."
+        ),
+        module_name="fifo",
+        demo_dir="fifo",
+        buggy_name="fifo_buggy.sv",
+        fixed_name="fifo_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_wrap.sv",
+        spec_name="fifo_spec.md",
+        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
+        fail_tag="WRAP_MISMATCH",
+        pass_tag="WRAP_TEST_PASS",
+        mock_fail_stdout="WRAP_MISMATCH expected=55 observed=33\n",
+        mock_pass_stdout="WRAP_TEST_PASS\n",
+    ),
+    "alu": CaseConfig(
+        case_id="alu",
+        title="ALU subtract opcode",
+        description=(
+            "Small ALU where SUB incorrectly adds instead of subtracts."
+        ),
+        module_name="alu",
+        demo_dir="alu",
+        buggy_name="alu_buggy.sv",
+        fixed_name="alu_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="alu_spec.md",
+        accepted_filenames=("alu_buggy.sv", "alu.sv"),
+        fail_tag="ALU_MISMATCH",
+        pass_tag="ALU_TEST_PASS",
+        mock_fail_stdout="ALU_MISMATCH expected=05 observed=0b\n",
+        mock_pass_stdout="ALU_TEST_PASS\n",
+    ),
+    "shift_reg": CaseConfig(
+        case_id="shift_reg",
+        title="Shift-register direction",
+        description=(
+            "Shift register that shifts left instead of the specified right shift."
+        ),
+        module_name="shift_reg",
+        demo_dir="shift_reg",
+        buggy_name="shift_reg_buggy.sv",
+        fixed_name="shift_reg_fixed.sv",
+        smoke_tb="tb_smoke.sv",
+        directed_tb="tb_directed.sv",
+        spec_name="shift_reg_spec.md",
+        accepted_filenames=("shift_reg_buggy.sv", "shift_reg.sv"),
+        fail_tag="SHIFT_MISMATCH",
+        pass_tag="SHIFT_TEST_PASS",
+        mock_fail_stdout="SHIFT_MISMATCH expected=40 observed=00\n",
+        mock_pass_stdout="SHIFT_TEST_PASS\n",
+    ),
+}
+
+
+def set_active_case(case_id: str) -> str:
+    global _ACTIVE_CASE_ID
+    if case_id not in CASE_CONFIGS:
+        raise ValueError(f"Unknown curated case_id: {case_id}")
+    _ACTIVE_CASE_ID = case_id
+    return case_id
+
+
+def get_active_case_id() -> str:
+    return _ACTIVE_CASE_ID
+
+
+def active_case() -> CaseConfig:
+    return CASE_CONFIGS[_ACTIVE_CASE_ID]
+
+
+def is_curated_case_id(case_id: str) -> bool:
+    return case_id in CASE_CONFIGS
+
+
+def allowlisted_candidate_path(case_id: str = "") -> str:
+    cfg = CASE_CONFIGS[case_id] if case_id in CASE_CONFIGS else active_case()
+    return f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
 
 
 @dataclass(frozen=True)
@@ -115,6 +233,28 @@ class UploadedInputPaths:
     test_module: str
 
 
+@dataclass(frozen=True)
+class GeneratedTestbench:
+    filename: str
+    path: str
+    module_name: str
+    mode: str
+    notes: str
+
+
+@dataclass(frozen=True)
+class LLMJobStatus:
+    job_id: str
+    kind: str
+    status: str
+    attempt: int
+    max_attempts: int
+    error: str
+    generated_testbench: GeneratedTestbench | None = None
+    hypotheses: list[HypothesisDraft] = field(default_factory=list)
+    artifact: ArtifactDraft | None = None
+
+
 # Backward-compatible aliases used by older tests during migration.
 ToolRun = ToolResult
 
@@ -144,6 +284,11 @@ def llm_backend() -> str:
     return os.environ.get("JACVERIFY_LLM_BACKEND", "firecrawl").strip().lower()
 
 
+def testgen_mode() -> str:
+    """Select AI test generation without changing the existing LLM mode."""
+    return "ai" if os.environ.get("JACVERIFY_AI_TESTGEN", "0") == "1" else "hardcoded"
+
+
 def _tool_error(
     *,
     tool: str,
@@ -170,33 +315,39 @@ def _tool_error(
     )
 
 
-def _fifo_paths(workspace_root: str) -> dict[str, Path]:
+def _case_paths(workspace_root: str, case: CaseConfig | None = None) -> dict[str, Path]:
+    cfg = case or active_case()
     root = Path(workspace_root).resolve()
-    fifo_dir = root / "demo" / "fifo"
+    case_dir = root / "demo" / cfg.demo_dir
     paths = {
         "root": root,
-        "fifo_dir": fifo_dir,
-        "buggy_rtl": fifo_dir / "fifo_buggy.sv",
-        "fixed_rtl": fifo_dir / "fifo_fixed.sv",
-        "smoke_tb": fifo_dir / "tb_smoke.sv",
-        "wrap_tb": fifo_dir / "tb_wrap.sv",
-        "spec_path": fifo_dir / "fifo_spec.md",
+        "case_dir": case_dir,
+        "buggy_rtl": case_dir / cfg.buggy_name,
+        "fixed_rtl": case_dir / cfg.fixed_name,
+        "smoke_tb": case_dir / cfg.smoke_tb,
+        "wrap_tb": case_dir / cfg.directed_tb,
+        "spec_path": case_dir / cfg.spec_name,
     }
     for key in ("buggy_rtl", "fixed_rtl", "smoke_tb", "wrap_tb", "spec_path"):
         path = paths[key]
-        if not path.is_file() or fifo_dir not in path.parents:
+        if not path.is_file() or case_dir not in path.parents:
             raise FileNotFoundError(
-                f"FIFO demo input missing or outside allow-list: {path}"
+                f"Demo input missing or outside allow-list: {path}"
             )
     return paths
 
 
+def _fifo_paths(workspace_root: str) -> dict[str, Path]:
+    return _case_paths(workspace_root, CASE_CONFIGS["fifo"])
+
+
 def load_spec(workspace_root: str) -> SpecLoadResult:
-    paths = _fifo_paths(workspace_root)
+    cfg = active_case()
+    paths = _case_paths(workspace_root, cfg)
     return load_uploaded_spec(
         str(paths["spec_path"]),
         str(paths["buggy_rtl"]),
-        "fifo",
+        cfg.module_name,
     )
 
 
@@ -248,13 +399,23 @@ def load_uploaded_spec(
 
 
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
-    match = WRAP_MISMATCH_RE.search(result.stdout or "")
+    match = MISMATCH_RE.search(result.stdout or "")
     if match:
         return FailureEvidence(
-            kind="WRAP_MISMATCH",
-            expected=match.group(1),
-            observed=match.group(2),
+            kind=match.group(1),
+            expected=match.group(2),
+            observed=match.group(3),
             cycle=None,
+            raw_stdout=result.stdout,
+            source_result=result,
+        )
+    generic = GENERIC_FAILURE_RE.search(result.stdout or "")
+    if generic:
+        return FailureEvidence(
+            kind=generic.group(1),
+            expected=generic.group(2),
+            observed=generic.group(3),
+            cycle=int(generic.group(4)) if generic.group(4) else None,
             raw_stdout=result.stdout,
             source_result=result,
         )
@@ -335,21 +496,30 @@ def parse_failure_from_stored(
 
 
 def _mock_compile() -> ToolResult:
+    cfg = active_case()
     return ToolResult(
         tool="iverilog",
         mode="mock",
         status=STATUS_PASSED,
         exit_code=0,
-        command=["mock:iverilog", "-g2012", "-tnull", "-s", "fifo", "fifo_buggy.sv"],
+        command=[
+            "mock:iverilog",
+            "-g2012",
+            "-tnull",
+            "-s",
+            cfg.module_name,
+            cfg.buggy_name,
+        ],
         duration_ms=1,
         stdout="mock lint/compile ok\n",
         stderr="",
         artifacts=[],
-        diagnostics={"stage": "compile"},
+        diagnostics={"stage": "compile", "case_id": cfg.case_id},
     )
 
 
 def _mock_smoke() -> ToolResult:
+    cfg = active_case()
     return ToolResult(
         tool="vvp",
         mode="mock",
@@ -360,46 +530,56 @@ def _mock_smoke() -> ToolResult:
         stdout="SMOKE_TEST_PASS\n",
         stderr="",
         artifacts=["mock:smoke.vvp"],
-        diagnostics={"stage": "smoke", "test": "tb_smoke"},
+        diagnostics={"stage": "smoke", "test": "tb_smoke", "case_id": cfg.case_id},
     )
 
 
 def _mock_regression(*, reproduce_bug: bool = True) -> ToolResult:
+    cfg = active_case()
     if reproduce_bug:
-        stdout = (
-            "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
-            "WRAP_MISMATCH expected=55 observed=33\n"
-        )
         return ToolResult(
             tool="vvp",
             mode="mock",
             status=STATUS_VERIFICATION_FAILED,
             exit_code=1,
-            command=["mock:vvp", "wrap_regression.vvp"],
+            command=["mock:vvp", "directed_regression.vvp"],
             duration_ms=2,
-            stdout=stdout,
+            stdout=(
+                "JACVERIFY_COVERAGE code=72.5 functional=66.7\n"
+                + cfg.mock_fail_stdout
+            ),
             stderr="",
-            artifacts=["mock:wrap_regression.vvp"],
-            diagnostics={"stage": "wrap_regression", "test": "tb_wrap"},
+            artifacts=["mock:directed_regression.vvp"],
+            diagnostics={
+                "stage": "directed_regression",
+                "test": cfg.directed_tb,
+                "case_id": cfg.case_id,
+            },
         )
     return ToolResult(
         tool="vvp",
         mode="mock",
         status=STATUS_BUG_NOT_REPRODUCED,
         exit_code=0,
-        command=["mock:vvp", "wrap_regression.vvp"],
+        command=["mock:vvp", "directed_regression.vvp"],
         duration_ms=2,
         stdout=(
             "JACVERIFY_COVERAGE code=88.0 functional=100.0\n"
-            "WRAP_TEST_PASS\n"
+            + cfg.mock_pass_stdout
         ),
         stderr="",
-        artifacts=["mock:wrap_regression.vvp"],
-        diagnostics={"stage": "wrap_regression", "test": "tb_wrap"},
+        artifacts=["mock:directed_regression.vvp"],
+        diagnostics={
+            "stage": "directed_regression",
+            "test": cfg.directed_tb,
+            "case_id": cfg.case_id,
+        },
     )
 
 
 def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
+    cfg = active_case()
+    candidate = allowlisted_candidate_path(cfg.case_id)
     if pass_result:
         return ToolResult(
             tool="vvp",
@@ -410,14 +590,15 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
             duration_ms=2,
             stdout=(
                 "JACVERIFY_COVERAGE code=91.0 functional=100.0\n"
-                "WRAP_TEST_PASS\n"
+                + cfg.mock_pass_stdout
             ),
             stderr="",
             artifacts=["mock:patched_reverify.vvp"],
             diagnostics={
                 "stage": "patched_reverify",
-                "candidate": "demo/fifo/fifo_fixed.sv",
+                "candidate": candidate,
                 "candidate_kind": "reviewed_fixture",
+                "case_id": cfg.case_id,
             },
         )
     return ToolResult(
@@ -429,14 +610,15 @@ def _mock_reverify(*, pass_result: bool = True) -> ToolResult:
         duration_ms=2,
         stdout=(
             "JACVERIFY_COVERAGE code=78.0 functional=66.7\n"
-            "WRAP_MISMATCH expected=55 observed=33\n"
+            + cfg.mock_fail_stdout
         ),
         stderr="",
         artifacts=["mock:patched_reverify.vvp"],
         diagnostics={
             "stage": "patched_reverify",
-            "candidate": "demo/fifo/fifo_fixed.sv",
+            "candidate": candidate,
             "candidate_kind": "reviewed_fixture",
+            "case_id": cfg.case_id,
         },
     )
 
@@ -514,6 +696,27 @@ def _module_name(source: str, label: str) -> str:
     return match.group(1)
 
 
+def _match_curated_config(
+    workspace_root: str,
+    design_content: str,
+    spec_content: str,
+) -> CaseConfig | None:
+    design_fp = source_fingerprint(design_content)
+    spec_fp = source_fingerprint(spec_content)
+    root = Path(workspace_root).resolve()
+    for cfg in CASE_CONFIGS.values():
+        design_path = root / "demo" / cfg.demo_dir / cfg.buggy_name
+        spec_path = root / "demo" / cfg.demo_dir / cfg.spec_name
+        if not design_path.is_file() or not spec_path.is_file():
+            continue
+        if (
+            design_fp == source_fingerprint(design_path.read_text(encoding="utf-8"))
+            and spec_fp == source_fingerprint(spec_path.read_text(encoding="utf-8"))
+        ):
+            return cfg
+    return None
+
+
 def materialize_uploaded_inputs(
     workspace_root: str,
     output_dir: str,
@@ -522,29 +725,233 @@ def materialize_uploaded_inputs(
     spec_filename: str,
     spec_content: str,
 ) -> UploadedInputPaths:
-    """Write design/spec inputs and inject the prototype generated testbench."""
+    """Write design/spec inputs; test generation is a separate pipeline stage."""
     inputs_dir = _ensure_output_dir(output_dir) / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     design_name = _safe_upload_name(design_filename, "design.sv")
     spec_name = _safe_upload_name(spec_filename, "spec.md")
-    test_name = "generated_tb_wrap.sv"
     design_path = inputs_dir / design_name
     spec_path = inputs_dir / spec_name
-    test_path = inputs_dir / test_name
     normalized_design = normalize_source(design_content)
     normalized_spec = normalize_source(spec_content)
-    normalized_test = normalize_source(
-        _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
-    )
     design_path.write_text(normalized_design, encoding="utf-8")
     spec_path.write_text(normalized_spec, encoding="utf-8")
-    test_path.write_text(normalized_test, encoding="utf-8")
     return UploadedInputPaths(
         design_path=str(design_path),
         spec_path=str(spec_path),
-        test_path=str(test_path),
+        test_path="",
         design_module=_module_name(normalized_design, "Uploaded design"),
-        test_module=_module_name(normalized_test, "Generated testbench"),
+        test_module="",
+    )
+
+
+def _strip_code_fence(source: str) -> str:
+    text = source.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines:
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _write_generated_testbench(
+    output_dir: str,
+    filename: str,
+    source: str,
+    *,
+    mode: str,
+    notes: str,
+) -> GeneratedTestbench:
+    inputs_dir = _ensure_output_dir(output_dir) / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    path = inputs_dir / _safe_upload_name(filename, "generated_testbench.sv")
+    normalized = normalize_source(_strip_code_fence(source))
+    module_name = _module_name(normalized, "Generated testbench")
+    path.write_text(normalized, encoding="utf-8")
+    return GeneratedTestbench(
+        filename=path.name,
+        path=str(path),
+        module_name=module_name,
+        mode=mode,
+        notes=notes,
+    )
+
+
+def generate_testbench_for_run(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> GeneratedTestbench:
+    """Generate a run-local testbench using AI or the hardcoded prototype."""
+    design = Path(design_path).read_text(encoding="utf-8")
+    spec = Path(spec_path).read_text(encoding="utf-8")
+    if testgen_mode() == "hardcoded":
+        matched = _match_curated_config(workspace_root, design, spec)
+        if matched is not None:
+            source = _case_paths(workspace_root, matched)["wrap_tb"].read_text(
+                encoding="utf-8"
+            )
+            filename = f"generated_{matched.directed_tb}"
+            mode = f"hardcoded:{matched.case_id}"
+            notes = (
+                f"Copied from the reviewed {matched.title} directed test fixture."
+            )
+        else:
+            source = _fifo_paths(workspace_root)["wrap_tb"].read_text(
+                encoding="utf-8"
+            )
+            filename = "generated_tb_wrap.sv"
+            mode = "hardcoded:fifo-prototype"
+            notes = "Copied from the reviewed FIFO wraparound test fixture."
+        return _write_generated_testbench(
+            output_dir,
+            filename,
+            source,
+            mode=mode,
+            notes=notes,
+        )
+
+    if llm_mode() != "live":
+        raise RuntimeError(
+            "AI test generation requires JACVERIFY_MOCK_LLM=0"
+        )
+    backend = llm_backend()
+    if backend != "firecrawl":
+        raise RuntimeError(
+            "AI test generation currently supports JACVERIFY_LLM_BACKEND=firecrawl"
+        )
+
+    prompt = f"""
+Act as a SystemVerilog verification engineer. Generate one complete,
+self-contained SystemVerilog testbench for the supplied design and
+specification.
+
+Rules:
+- Return code in the testbench field without Markdown fences.
+- Target Icarus Verilog with -g2012 and use conservative testbench syntax.
+- Instantiate the exact DUT module and connect its declared ports.
+- Include a clock/reset sequence when the interface needs one.
+- Exercise the most important requirements with bounded directed stimulus.
+- On success print JACVERIFY_TEST_PASS and finish with exit code 0.
+- On a detected mismatch print exactly:
+  JACVERIFY_FAILURE kind=<TOKEN> expected=<TOKEN> observed=<TOKEN> cycle=<N>
+  then call $fatal(1).
+- Do not use UVM, external files, DPI, shell commands, or unbounded loops.
+- Use begin/end for procedural blocks, never C-style braces.
+- Call tasks with positional arguments, never named arguments.
+- Do not use queues, dynamic arrays, classes, interfaces, program blocks,
+  clocking blocks, parameter-sized casts, or unsupported assertion syntax.
+- Prefer fixed-size arrays, integer loop variables declared at module scope,
+  and plain Verilog-compatible tasks.
+
+SPECIFICATION:
+{spec[:2500]}
+
+DESIGN:
+{design[:6500]}
+""".strip()
+    data = _firecrawl_agent(
+        prompt=prompt,
+        schema={
+            "type": "object",
+            "properties": {
+                "testbench": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["testbench", "notes"],
+            "additionalProperties": False,
+        },
+    )
+    source = str(data.get("testbench", "")).strip()
+    if not source:
+        raise RuntimeError("AI test generation returned an empty testbench")
+    notes = str(data.get("notes", "")).strip()[:1000]
+    generated = _write_generated_testbench(
+        output_dir,
+        "generated_ai_testbench.sv",
+        source,
+        mode="ai:firecrawl",
+        notes=notes,
+    )
+    validation = lint_compile(
+        workspace_root,
+        output_dir,
+        design_path,
+        generated.path,
+        generated.module_name,
+    )
+    repair_attempts = int(
+        os.environ.get("JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS", "1")
+    )
+    if not 0 <= repair_attempts <= 2:
+        raise RuntimeError("JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS must be 0..2")
+
+    for repair_attempt in range(1, repair_attempts + 1):
+        if validation.status == STATUS_PASSED:
+            return generated
+        compile_error = (validation.stderr or validation.stdout).strip()
+        repair_data = _firecrawl_agent(
+            prompt=f"""
+Repair the SystemVerilog testbench below so that this command succeeds:
+iverilog -g2012 -s {generated.module_name} DESIGN TESTBENCH
+
+Return the complete replacement testbench only in the testbench field.
+Preserve the DUT ports and JACVERIFY_TEST_PASS / JACVERIFY_FAILURE protocol.
+Use conservative Icarus-compatible syntax: begin/end procedural blocks,
+positional task calls, fixed-size arrays, and no queues, dynamic arrays,
+classes, interfaces, named task arguments, parameter-sized casts, or
+unsupported assertions.
+
+IVERILOG ERRORS:
+{compile_error[:3500]}
+
+DESIGN:
+{design[:6500]}
+
+INVALID TESTBENCH:
+{source[:9000]}
+""".strip(),
+            schema={
+                "type": "object",
+                "properties": {
+                    "testbench": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["testbench", "notes"],
+                "additionalProperties": False,
+            },
+        )
+        source = str(repair_data.get("testbench", "")).strip()
+        if not source:
+            raise RuntimeError("AI testbench repair returned empty source")
+        generated = _write_generated_testbench(
+            output_dir,
+            "generated_ai_testbench.sv",
+            source,
+            mode="ai:firecrawl",
+            notes=(
+                f"{notes} Auto-repaired after compile failure "
+                f"(attempt {repair_attempt})."
+            ).strip()[:1000],
+        )
+        validation = lint_compile(
+            workspace_root,
+            output_dir,
+            design_path,
+            generated.path,
+            generated.module_name,
+        )
+
+    if validation.status == STATUS_PASSED:
+        return generated
+    compile_error = (validation.stderr or validation.stdout).strip()
+    raise RuntimeError(
+        "AI-generated testbench did not compile after "
+        f"{repair_attempts} repair attempt(s): {compile_error[:2000]}"
     )
 
 
@@ -574,10 +981,11 @@ def lint_compile(
     testbench = Path(test_path).resolve() if test_path else None
     artifacts = _ensure_output_dir(output_dir)
     command = ["iverilog", "-g2012", "-tnull"]
-    if top_module:
-        command.extend(["-s", top_module])
+    top = top_module or active_case().module_name
+    if top_module or not testbench:
+        command.extend(["-s", top])
     else:
-        command.extend(["-s", "fifo"])
+        command.extend(["-s", testbench.stem])
     command.append(str(rtl))
     if testbench is not None:
         command.append(str(testbench))
@@ -589,7 +997,7 @@ def lint_compile(
             "stage": "compile",
             "design": str(rtl),
             "test": str(testbench) if testbench is not None else "",
-            "top": top_module or "fifo",
+            "top": top_module or (testbench.stem if testbench else top),
         },
     )
     if result.status == STATUS_PASSED:
@@ -679,9 +1087,10 @@ def _compile_and_simulate(
 
 
 def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         return _mock_smoke()
-    paths = _fifo_paths(workspace_root) if not candidate_path or not test_path else {}
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
         stage="smoke",
@@ -708,20 +1117,21 @@ def run_smoke(workspace_root: str, output_dir: str) -> ToolResult:
 
 
 def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
+    cfg = active_case()
     if tools_mode() == "mock":
         force = os.environ.get("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", "")
         return _mock_regression(reproduce_bug=force != "1")
-    paths = _fifo_paths(workspace_root)
+    paths = _case_paths(workspace_root, cfg)
     artifacts = _ensure_output_dir(output_dir)
     result = _compile_and_simulate(
-        stage="wrap_regression",
+        stage="directed_regression",
         rtl=paths["buggy_rtl"],
         testbench=paths["wrap_tb"],
         output_dir=artifacts,
     )
     if result.status == STATUS_TOOL_ERROR and result.diagnostics.get("error"):
         return result
-    if "WRAP_MISMATCH" in result.stdout:
+    if cfg.fail_tag in result.stdout:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -732,9 +1142,13 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
             stdout=result.stdout,
             stderr=result.stderr,
             artifacts=result.artifacts,
-            diagnostics={**result.diagnostics, "stage": "wrap_regression"},
+            diagnostics={
+                **result.diagnostics,
+                "stage": "directed_regression",
+                "case_id": cfg.case_id,
+            },
         )
-    if "WRAP_TEST_PASS" in result.stdout or result.exit_code == 0:
+    if cfg.pass_tag in result.stdout or result.exit_code == 0:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -745,7 +1159,11 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
             stdout=result.stdout,
             stderr=result.stderr,
             artifacts=result.artifacts,
-            diagnostics={**result.diagnostics, "stage": "wrap_regression"},
+            diagnostics={
+                **result.diagnostics,
+                "stage": "directed_regression",
+                "case_id": cfg.case_id,
+            },
         )
     return ToolResult(
         tool=result.tool,
@@ -759,8 +1177,9 @@ def run_wrap_regression(workspace_root: str, output_dir: str) -> ToolResult:
         artifacts=result.artifacts,
         diagnostics={
             **result.diagnostics,
-            "stage": "wrap_regression",
+            "stage": "directed_regression",
             "error": "malformed_output",
+            "case_id": cfg.case_id,
         },
     )
 
@@ -870,7 +1289,8 @@ def run_reverify(
             )
         force_fail = os.environ.get("JACVERIFY_FORCE_REVERIFY_FAIL", "")
         return _mock_reverify(pass_result=force_fail != "1")
-    paths = _fifo_paths(workspace_root)
+    cfg = active_case()
+    paths = _case_paths(workspace_root, cfg)
     candidate = (
         Path(candidate_path).resolve()
         if candidate_path and Path(candidate_path).is_absolute()
@@ -898,8 +1318,11 @@ def run_reverify(
         "candidate": str(candidate),
         "candidate_kind": "reviewed_fixture",
         "test": str(testbench),
+        "case_id": cfg.case_id,
     }
-    if result.status == STATUS_PASSED and "WRAP_TEST_PASS" in result.stdout:
+    if result.status == STATUS_PASSED and (
+        cfg.pass_tag in result.stdout or result.exit_code == 0
+    ):
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -912,7 +1335,7 @@ def run_reverify(
             artifacts=result.artifacts,
             diagnostics=diagnostics,
         )
-    if "WRAP_MISMATCH" in result.stdout:
+    if cfg.fail_tag in result.stdout or MISMATCH_RE.search(result.stdout or ""):
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -958,9 +1381,62 @@ class ArtifactDraft:
 
 
 def rank_hypotheses_mock(failure: FailureEvidence) -> list[HypothesisDraft]:
-    """Deterministic diagnosis aligned with the planted write-pointer wrap bug."""
+    """Deterministic diagnosis aligned with the active curated case's planted bug."""
+    cfg = active_case()
     expected = failure.expected or "?"
     observed = failure.observed or "?"
+    if cfg.case_id == "alu":
+        return [
+            HypothesisDraft(
+                rank=1,
+                claim=(
+                    "SUB opcode incorrectly computes a+b instead of a-b "
+                    f"(expected={expected}, observed={observed})."
+                ),
+                confidence=0.91,
+                next_action=(
+                    "Apply reviewed ALU SUB fix fixture and reverify."
+                ),
+            ),
+            HypothesisDraft(
+                rank=2,
+                claim="ADD opcode wraps incorrectly on overflow.",
+                confidence=0.16,
+                next_action="Compare ADD vectors against wrap semantics.",
+            ),
+            HypothesisDraft(
+                rank=3,
+                claim="Registered result updates one cycle late relative to opcode.",
+                confidence=0.08,
+                next_action="Inspect always_ff sampling against tb_directed timing.",
+            ),
+        ]
+    if cfg.case_id == "shift_reg":
+        return [
+            HypothesisDraft(
+                rank=1,
+                claim=(
+                    "Shift direction is inverted: register shifts left instead of "
+                    f"right (expected={expected}, observed={observed})."
+                ),
+                confidence=0.91,
+                next_action=(
+                    "Apply reviewed right-shift fix fixture and reverify."
+                ),
+            ),
+            HypothesisDraft(
+                rank=2,
+                claim="serial_in is wired into the LSB instead of the MSB on shift.",
+                confidence=0.17,
+                next_action="Trace serial_in concatenation in the shift branch.",
+            ),
+            HypothesisDraft(
+                rank=3,
+                claim="load path corrupts q before the directed shift sequence.",
+                confidence=0.07,
+                next_action="Check load vs shift priority against the smoke test.",
+            ),
+        ]
     return [
         HypothesisDraft(
             rank=1,
@@ -992,15 +1468,17 @@ def generate_artifact_mock(
     hypothesis: HypothesisDraft,
     module_name: str,
 ) -> ArtifactDraft:
+    cfg = active_case()
+    candidate_path = f"demo/{cfg.demo_dir}/{cfg.fixed_name}"
     return ArtifactDraft(
         kind="reviewed_candidate_fixture",
         description=(
-            f"Directed wraparound reverify artifact for module `{module_name}`: "
-            "apply pre-reviewed candidate `demo/fifo/fifo_fixed.sv` that restores "
-            "write_ptr wrap-to-zero, then rerun tb_wrap."
+            f"Directed reverify artifact for module `{module_name}`: "
+            f"apply pre-reviewed candidate `{candidate_path}`, then rerun "
+            f"{cfg.directed_tb}."
         ),
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="reviewed_fixture:fifo_fixed.sv",
+        candidate_path=candidate_path,
+        candidate_label=f"reviewed_fixture:{cfg.fixed_name}",
         hypothesis_claim=hypothesis.claim,
         notes=(
             "Candidate is a pre-reviewed fixture, not an LLM-authored RTL patch."
@@ -1027,7 +1505,10 @@ def _firecrawl_agent(
     model = os.environ.get("JACVERIFY_FIRECRAWL_MODEL", "spark-1-mini").strip()
     max_credits = int(os.environ.get("JACVERIFY_FIRECRAWL_MAX_CREDITS", "100"))
     timeout_seconds = int(
-        os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "60")
+        os.environ.get(
+            "JACVERIFY_LLM_TIMEOUT_SECONDS",
+            os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "45"),
+        )
     )
     poll_seconds = float(
         os.environ.get("JACVERIFY_FIRECRAWL_POLL_SECONDS", "2")
@@ -1046,6 +1527,8 @@ def _firecrawl_agent(
         "User-Agent": "JacVerify/0.1",
     }
 
+    deadline = time.monotonic() + timeout_seconds
+
     def request_json(
         url: str,
         *,
@@ -1063,8 +1546,15 @@ def _firecrawl_agent(
             headers=headers,
             method=method,
         )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Firecrawl agent timed out after {timeout_seconds}s"
+            )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(
+                request, timeout=max(1.0, min(20.0, remaining))
+            ) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
@@ -1095,7 +1585,6 @@ def _firecrawl_agent(
             f"Firecrawl did not start an agent job: {started.get('error', started)}"
         )
 
-    deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = request_json(f"{base_url}/agent/{job_id}", method="GET")
         state = status.get("status")
@@ -1110,9 +1599,9 @@ def _firecrawl_agent(
             )
         if state != "processing":
             raise RuntimeError(f"Unexpected Firecrawl agent status: {state!r}")
-        time.sleep(poll_seconds)
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
-    raise RuntimeError(
+    raise TimeoutError(
         f"Firecrawl agent timed out after {timeout_seconds}s"
     )
 
@@ -1259,11 +1748,12 @@ def generate_artifact_firecrawl(
         or not rationale
     ):
         raise RuntimeError("Firecrawl returned an invalid artifact proposal")
+    candidate = allowlisted_candidate_path()
     return ArtifactDraft(
         kind=f"firecrawl_{kind}",
         description=f"{description} Verification goal: {verification_goal}",
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        candidate_path=candidate,
+        candidate_label=f"allowlisted_fixture:{Path(candidate).name}",
         hypothesis_claim=hypothesis.claim,
         notes=(
             f"{rationale} Firecrawl cannot choose or write the RTL path; "
@@ -1297,6 +1787,139 @@ def generate_artifact(
         "generate_artifact_for_run in jacverify/store.jac. This Python adapter "
         "only owns the deterministic mock implementation."
     )
+
+
+_LLM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("JACVERIFY_LLM_WORKERS", "4")),
+    thread_name_prefix="jacverify-llm",
+)
+_LLM_JOBS: dict[str, dict[str, Any]] = {}
+_LLM_JOBS_LOCK = threading.Lock()
+
+
+def _llm_max_attempts() -> int:
+    retries = int(os.environ.get("JACVERIFY_LLM_RETRIES", "1"))
+    if not 0 <= retries <= 3:
+        raise RuntimeError("JACVERIFY_LLM_RETRIES must be 0..3")
+    return retries + 1
+
+
+def _run_llm_job(job_id: str, operation: Callable[[], Any]) -> None:
+    with _LLM_JOBS_LOCK:
+        max_attempts = int(_LLM_JOBS[job_id]["max_attempts"])
+    for attempt in range(1, max_attempts + 1):
+        with _LLM_JOBS_LOCK:
+            job = _LLM_JOBS[job_id]
+            job["status"] = "running"
+            job["attempt"] = attempt
+            job["error"] = ""
+        try:
+            result = operation()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with _LLM_JOBS_LOCK:
+                job = _LLM_JOBS[job_id]
+                job["error"] = error
+                job["status"] = (
+                    "retrying" if attempt < max_attempts else "failed"
+                )
+            if attempt < max_attempts:
+                time.sleep(
+                    float(os.environ.get("JACVERIFY_LLM_RETRY_DELAY_SECONDS", "1"))
+                )
+                continue
+            return
+        with _LLM_JOBS_LOCK:
+            job = _LLM_JOBS[job_id]
+            job["result"] = result
+            job["status"] = "completed"
+        return
+
+
+def _start_llm_job(kind: str, operation: Callable[[], Any]) -> str:
+    job_id = f"{kind}-{uuid.uuid4().hex}"
+    with _LLM_JOBS_LOCK:
+        _LLM_JOBS[job_id] = {
+            "kind": kind,
+            "status": "queued",
+            "attempt": 0,
+            "max_attempts": _llm_max_attempts(),
+            "error": "",
+            "result": None,
+        }
+    _LLM_EXECUTOR.submit(_run_llm_job, job_id, operation)
+    return job_id
+
+
+def start_testbench_generation_job(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> str:
+    return _start_llm_job(
+        "testbench",
+        lambda: generate_testbench_for_run(
+            workspace_root, output_dir, design_path, spec_path
+        ),
+    )
+
+
+def start_hypothesis_ranking_job(failure: FailureEvidence) -> str:
+    return _start_llm_job(
+        "hypotheses",
+        lambda: rank_hypotheses(failure),
+    )
+
+
+def start_artifact_generation_job(
+    hypothesis: HypothesisDraft, module_name: str
+) -> str:
+    return _start_llm_job(
+        "artifact",
+        lambda: generate_artifact(hypothesis, module_name),
+    )
+
+
+def poll_llm_job(job_id: str) -> LLMJobStatus:
+    with _LLM_JOBS_LOCK:
+        job = _LLM_JOBS.get(job_id)
+        if job is None:
+            return LLMJobStatus(
+                job_id=job_id,
+                kind="unknown",
+                status="failed",
+                attempt=0,
+                max_attempts=0,
+                error=(
+                    "Background LLM job was lost, likely because the service "
+                    "restarted while it was running."
+                ),
+            )
+        result = job["result"]
+        kind = str(job["kind"])
+        return LLMJobStatus(
+            job_id=job_id,
+            kind=kind,
+            status=str(job["status"]),
+            attempt=int(job["attempt"]),
+            max_attempts=int(job["max_attempts"]),
+            error=str(job["error"]),
+            generated_testbench=(
+                result if kind == "testbench" and result is not None else None
+            ),
+            hypotheses=(
+                result if kind == "hypotheses" and result is not None else []
+            ),
+            artifact=(
+                result if kind == "artifact" and result is not None else None
+            ),
+        )
+
+
+def discard_llm_job(job_id: str) -> None:
+    with _LLM_JOBS_LOCK:
+        _LLM_JOBS.pop(job_id, None)
 
 
 def make_failure_evidence(
@@ -1386,19 +2009,20 @@ class UploadMatch:
     generated_test_filename: str = "generated_tb_wrap.sv"
 
 
-CURATED_CASES: tuple[CuratedCase, ...] = (
+CURATED_CASES: tuple[CuratedCase, ...] = tuple(
     CuratedCase(
-        case_id="fifo",
-        title="FIFO wraparound",
+        case_id=cfg.case_id,
+        title=cfg.title,
         description=(
-            "Module-level FIFO with a planted write-pointer wrap bug. "
-            "Hackathon demo uses a reviewed fix fixture for re-verification."
+            f"{cfg.description} Hackathon demo uses a reviewed fix fixture "
+            "for re-verification."
         ),
-        buggy_relpath="demo/fifo/fifo_buggy.sv",
-        spec_relpath="demo/fifo/fifo_spec.md",
-        test_relpath="demo/fifo/tb_wrap.sv",
-        accepted_filenames=("fifo_buggy.sv", "fifo.sv"),
-    ),
+        buggy_relpath=f"demo/{cfg.demo_dir}/{cfg.buggy_name}",
+        spec_relpath=f"demo/{cfg.demo_dir}/{cfg.spec_name}",
+        test_relpath=f"demo/{cfg.demo_dir}/{cfg.directed_tb}",
+        accepted_filenames=cfg.accepted_filenames,
+    )
+    for cfg in CASE_CONFIGS.values()
 )
 
 
@@ -1470,7 +2094,8 @@ def identify_uploaded_case(
             "This upload is not one of today's curated demo cases. "
             "JacVerify's upload path is enabled, but the hackathon runtime "
             f"only executes prepared designs ({known}). "
-            "Try uploading demo/fifo/fifo_buggy.sv."
+            "Try uploading demo/fifo/fifo_buggy.sv, demo/alu/alu_buggy.sv, "
+            "or demo/shift_reg/shift_reg_buggy.sv."
         ),
         filename=basename,
     )
@@ -1486,6 +2111,16 @@ def identify_uploaded_inputs(
     """Validate design/spec inputs and recognize optional curated fixtures."""
     design_basename = _safe_upload_name(design_filename, "design.sv")
     spec_basename = _safe_upload_name(spec_filename, "spec.md")
+    generated_name = (
+        "generated_ai_testbench.sv"
+        if testgen_mode() == "ai"
+        else "generated_tb_wrap.sv"
+    )
+    generation_description = (
+        "an AI-generated Firecrawl testbench"
+        if testgen_mode() == "ai"
+        else "the prototype generated FIFO testbench"
+    )
     if not design_content or not design_content.strip():
         return UploadMatch(
             accepted=False,
@@ -1494,6 +2129,7 @@ def identify_uploaded_inputs(
             message="Upload an RTL design file to continue.",
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
     if not spec_content or not spec_content.strip():
         return UploadMatch(
@@ -1503,6 +2139,7 @@ def identify_uploaded_inputs(
             message="Upload a specification file to continue.",
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
     try:
         _module_name(design_content, "Uploaded design")
@@ -1514,6 +2151,7 @@ def identify_uploaded_inputs(
             message=str(exc),
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
 
     design_fp = source_fingerprint(design_content)
@@ -1534,11 +2172,16 @@ def identify_uploaded_inputs(
                 case_title=case.title,
                 message=(
                     f"Ready: `{design_basename}` and `{spec_basename}` match "
-                    "the reviewed FIFO fixture. JacVerify will generate the "
-                    "prototype wraparound testbench."
+                    f"curated case `{case.title}`. JacVerify will use "
+                    f"{generation_description}."
                 ),
                 filename=design_basename,
                 spec_filename=spec_basename,
+                generated_test_filename=(
+                    generated_name
+                    if testgen_mode() == "ai"
+                    else f"generated_{Path(case.test_relpath).name}"
+                ),
             )
 
     return UploadMatch(
@@ -1547,15 +2190,65 @@ def identify_uploaded_inputs(
         case_title="Spec-driven design verification",
         message=(
             f"Ready: `{design_basename}` will be checked against "
-            f"`{spec_basename}` using the prototype generated FIFO testbench."
+            f"`{spec_basename}` using {generation_description}."
         ),
         filename=design_basename,
         spec_filename=spec_basename,
+        generated_test_filename=generated_name,
     )
 
 
 def read_text_file(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
+
+
+def render_code_diff(
+    before_path: str,
+    after_path: str,
+    before_label: str = "before",
+    after_label: str = "after",
+) -> str:
+    """Return a unified diff suitable for display in the verification timeline."""
+    before = Path(before_path).read_text(encoding="utf-8").splitlines()
+    after = Path(after_path).read_text(encoding="utf-8").splitlines()
+    return "\n".join(
+        difflib.unified_diff(
+            before,
+            after,
+            fromfile=before_label,
+            tofile=after_label,
+            lineterm="",
+        )
+    )
+
+
+def publish_candidate_output(
+    workspace_root: str,
+    output_dir: str,
+    candidate_path: str,
+) -> str:
+    """Copy an allow-listed reviewed candidate into this run's output folder."""
+    workspace = Path(workspace_root).resolve()
+    source = (
+        Path(candidate_path).resolve()
+        if Path(candidate_path).is_absolute()
+        else (workspace / candidate_path).resolve()
+    )
+    if source != workspace and workspace not in source.parents:
+        raise ValueError("Candidate output must stay inside the workspace")
+    if not source.is_file():
+        raise FileNotFoundError(f"Candidate output does not exist: {source}")
+    destination_dir = Path(output_dir).resolve() / "outputs"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    shutil.copy2(source, destination)
+    return str(destination)
+
+
+def text_file_data_url(path: str) -> str:
+    """Encode a run-local text artifact as a browser-downloadable data URL."""
+    encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    return f"data:text/plain;charset=utf-8;base64,{encoded}"
 
 
 def load_curated_case_upload(
@@ -1566,11 +2259,23 @@ def load_curated_case_upload(
     for case in CURATED_CASES:
         if case.case_id != case_id:
             continue
-        text = _case_buggy_text(workspace_root, case)
-        return identify_uploaded_case(
+        root = Path(workspace_root).resolve()
+        design = (root / case.buggy_relpath).read_text(encoding="utf-8")
+        spec = (root / case.spec_relpath).read_text(encoding="utf-8")
+        # Preserve design-only helper used by older tests when only RTL is needed.
+        design_only = identify_uploaded_case(
             workspace_root,
             Path(case.buggy_relpath).name,
-            text,
+            design,
+        )
+        if design_only.accepted:
+            return design_only
+        return identify_uploaded_inputs(
+            workspace_root,
+            Path(case.buggy_relpath).name,
+            design,
+            Path(case.spec_relpath).name,
+            spec,
         )
     return UploadMatch(
         accepted=False,

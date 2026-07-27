@@ -1,19 +1,26 @@
-"""JacVerify graph model, seven-walker FIFO pipeline, and dashboard endpoints."""
+"""JacVerify graph model, eight-walker FIFO pipeline, and dashboard endpoints."""
 
 import os;
+import time;
 import from jacverify.tool_adapter {
     ArtifactDraft,
     CoverageResult,
     FailureEvidence,
+    GeneratedTestbench,
     HypothesisDraft,
+    LLMJobStatus,
     SpecLoadResult,
     ToolResult,
     UploadMatch,
     UploadedInputPaths,
+    allowlisted_candidate_path,
     coverage_from_result,
+    discard_llm_job,
     fresh_run_id,
     generate_artifact,
+    generate_testbench_for_run,
     identify_uploaded_inputs,
+    is_curated_case_id,
     lint_compile,
     llm_backend,
     llm_mode,
@@ -22,10 +29,19 @@ import from jacverify.tool_adapter {
     make_artifact_draft,
     make_hypothesis_draft,
     read_text_file,
+    render_code_diff,
     parse_failure_from_stored,
+    poll_llm_job,
+    publish_candidate_output,
     rank_hypotheses,
     run_reverify,
     run_uploaded_test,
+    start_artifact_generation_job,
+    start_hypothesis_ranking_job,
+    start_testbench_generation_job,
+    testgen_mode,
+    text_file_data_url,
+    set_active_case,
     tools_mode
 }
 import from jacverify.llm_calls {
@@ -131,6 +147,7 @@ node Run {
         artifact_description: str = "",
         candidate_label: str = "",
         candidate_path: str = "",
+        candidate_output_path: str = "",
         candidate_applied: bool = False,
         reverify_status: str = "NOT_RUN",
         reverify_stdout: str = "",
@@ -144,6 +161,15 @@ node Run {
         input_spec_path: str = "",
         input_test_path: str = "",
         testbench_name: str = "",
+        test_generation_mode: str = "hardcoded",
+        test_generation_source: str = "",
+        test_generation_notes: str = "",
+        llm_job_id: str = "",
+        llm_job_kind: str = "",
+        llm_job_status: str = "idle",
+        llm_job_attempt: int = 0,
+        llm_job_max_attempts: int = 0,
+        llm_job_error: str = "",
         reviewed_candidate_available: bool = False,
         coverage_available: bool = False,
         code_coverage: float = 0.0,
@@ -203,7 +229,9 @@ node TransitionRecord {
         summary: str,
         evidence_kind: str,
         evidence_ids: list[str],
-        walker_name: str = "";
+        walker_name: str = "",
+        code_change_title: str = "",
+        code_change_content: str = "";
 }
 
 edge HasTransition: Run --> TransitionRecord {}
@@ -252,7 +280,18 @@ obj TransitionView {
         summary: str,
         evidence_kind: str,
         evidence_ids: list[str],
-        walker_name: str = "";
+        walker_name: str = "",
+        code_change_title: str = "",
+        code_change_content: str = "";
+}
+
+obj OutputFileView {
+    has filename: str,
+        kind: str,
+        relative_path: str,
+        size_bytes: int,
+        content: str,
+        download_href: str;
 }
 
 obj DashboardData {
@@ -304,11 +343,20 @@ obj DemoRunResult {
         uploaded_filename: str = "",
         uploaded_spec_filename: str = "",
         uploaded_test_filename: str = "",
+        test_generation_mode: str = "hardcoded",
+        test_generation_source: str = "",
+        test_generation_notes: str = "",
+        llm_job_kind: str = "",
+        llm_job_status: str = "idle",
+        llm_job_attempt: int = 0,
+        llm_job_max_attempts: int = 0,
+        llm_job_error: str = "",
         coverage_available: bool = False,
         code_coverage: float = 0.0,
         functional_coverage: float = 0.0,
         coverage_source: str = "not_reported",
-        upload_accepted: bool = False;
+        upload_accepted: bool = False,
+        output_files: list[OutputFileView] = [];
 }
 
 obj UploadPreview {
@@ -593,7 +641,9 @@ def append_transition(
     summary: str,
     evidence_kind: str,
     evidence_ids: list[str],
-    walker_name: str
+    walker_name: str,
+    code_change_title: str = "",
+    code_change_content: str = ""
 ) -> TransitionView {
     sequence = len([run ->:HasTransition:->]) + 1;
     run +>:HasTransition:+> TransitionRecord(
@@ -604,7 +654,9 @@ def append_transition(
         summary=summary,
         evidence_kind=evidence_kind,
         evidence_ids=evidence_ids,
-        walker_name=walker_name
+        walker_name=walker_name,
+        code_change_title=code_change_title,
+        code_change_content=code_change_content
     );
     run.current_state = to_state;
     if not run.walker_log or run.walker_log[-1] != walker_name {
@@ -618,7 +670,9 @@ def append_transition(
         summary=summary,
         evidence_kind=evidence_kind,
         evidence_ids=evidence_ids,
-        walker_name=walker_name
+        walker_name=walker_name,
+        code_change_title=code_change_title,
+        code_change_content=code_change_content
     );
 }
 
@@ -672,10 +726,50 @@ def list_run_transitions(run: Run) -> list[TransitionView] {
             summary=record.summary,
             evidence_kind=record.evidence_kind,
             evidence_ids=record.evidence_ids,
-            walker_name=record.walker_name
+            walker_name=record.walker_name,
+            code_change_title=record.code_change_title,
+            code_change_content=record.code_change_content
         )
         for record in records
     ];
+}
+
+def build_output_files(run: Run) -> list[OutputFileView] {
+    files: list[OutputFileView] = [];
+    if run.input_test_path and os.path.isfile(run.input_test_path) {
+        files.append(
+            OutputFileView(
+                filename=os.path.basename(run.input_test_path),
+                kind="GENERATED TESTBENCH",
+                relative_path=os.path.relpath(
+                    run.input_test_path,
+                    run.output_dir
+                ),
+                size_bytes=os.path.getsize(run.input_test_path),
+                content=read_text_file(run.input_test_path),
+                download_href=text_file_data_url(run.input_test_path)
+            )
+        );
+    }
+    if (
+        run.candidate_output_path
+        and os.path.isfile(run.candidate_output_path)
+    ) {
+        files.append(
+            OutputFileView(
+                filename=os.path.basename(run.candidate_output_path),
+                kind="REPAIRED RTL",
+                relative_path=os.path.relpath(
+                    run.candidate_output_path,
+                    run.output_dir
+                ),
+                size_bytes=os.path.getsize(run.candidate_output_path),
+                content=read_text_file(run.candidate_output_path),
+                download_href=text_file_data_url(run.candidate_output_path)
+            )
+        );
+    }
+    return files;
 }
 
 def build_demo_result(run: Run) -> DemoRunResult {
@@ -734,11 +828,20 @@ def build_demo_result(run: Run) -> DemoRunResult {
         uploaded_filename=run.uploaded_filename,
         uploaded_spec_filename=run.uploaded_spec_filename,
         uploaded_test_filename=run.uploaded_test_filename,
+        test_generation_mode=run.test_generation_mode,
+        test_generation_source=run.test_generation_source,
+        test_generation_notes=run.test_generation_notes,
+        llm_job_kind=run.llm_job_kind,
+        llm_job_status=run.llm_job_status,
+        llm_job_attempt=run.llm_job_attempt,
+        llm_job_max_attempts=run.llm_job_max_attempts,
+        llm_job_error=run.llm_job_error,
         coverage_available=run.coverage_available,
         code_coverage=run.code_coverage,
         functional_coverage=run.functional_coverage,
         coverage_source=run.coverage_source,
-        upload_accepted=run.case_id != ""
+        upload_accepted=run.case_id != "",
+        output_files=build_output_files(run)
     );
 }
 
@@ -767,15 +870,21 @@ def rejected_upload_result(upload_match: UploadMatch) -> DemoRunResult {
     );
 }
 
-def run_case_pipeline(
+def create_case_run(
     case_id: str,
     case_title: str,
     design_filename: str,
     design_content: str,
     spec_filename: str,
     spec_content: str
-) -> DemoRunResult {
+) -> Run {
     workspace_root = os.getcwd();
+    if is_curated_case_id(case_id) {
+        set_active_case(case_id);
+    } else {
+        # Generic uploads keep the FIFO prototype tooling defaults.
+        set_active_case("fifo");
+    }
     run_id = new_run_id();
     output_dir = os.path.join(workspace_root, "runs", run_id);
     inputs: UploadedInputPaths = materialize_uploaded_inputs(
@@ -800,37 +909,71 @@ def run_case_pipeline(
         case_title=case_title,
         uploaded_filename=design_filename,
         uploaded_spec_filename=spec_filename,
-        uploaded_test_filename=os.path.basename(inputs.test_path),
+        uploaded_test_filename="",
         input_design_path=inputs.design_path,
         input_spec_path=inputs.spec_path,
-        input_test_path=inputs.test_path,
+        input_test_path="",
         module_name=inputs.design_module,
         module_path=inputs.design_path,
-        testbench_name=inputs.test_module,
-        reviewed_candidate_available=case_id == "fifo"
+        testbench_name="",
+        test_generation_mode=testgen_mode(),
+        reviewed_candidate_available=is_curated_case_id(case_id)
     );
+    return run;
+}
 
-    root spawn LoadInputsWalker(run_id=run_id);
-    if run.status == "running" {
-        root spawn CompileWalker(run_id=run_id);
+def advance_run_node(run: Run) -> None {
+    if run.status != "running" {
+        return;
+    }
+    if run.current_state == "S0_SPEC_INGEST" {
+        root spawn LoadInputsWalker(run_id=run.run_id);
+    } elif run.current_state == "S2_TEST_GENERATION" {
+        root spawn GenerateTestbenchWalker(run_id=run.run_id);
+    } elif run.current_state == "S3_STATIC_CHECK" {
+        root spawn CompileWalker(run_id=run.run_id);
+    } elif run.current_state == "S4_COMPILE_ELAB" {
+        root spawn SimulateWalker(run_id=run.run_id);
+    } elif run.current_state == "D0_FAILURE_NORMALIZE" {
+        root spawn StructureFailureWalker(run_id=run.run_id);
+    } elif run.current_state == "D1_HYPOTHESIS_RANK" {
+        root spawn RankHypothesesWalker(run_id=run.run_id);
+    } elif run.current_state == "D3_GENERATE_ARTIFACT" {
+        root spawn GenerateArtifactWalker(run_id=run.run_id);
+    } elif run.current_state == "D4_APPLY_CANDIDATE" {
+        root spawn ReverifyAndRenderWalker(run_id=run.run_id);
+    } else {
+        block_run(
+            run,
+            "No verification step is registered for " + run.current_state,
+            "advance_run_node"
+        );
+    }
+}
+
+def run_case_pipeline(
+    case_id: str,
+    case_title: str,
+    design_filename: str,
+    design_content: str,
+    spec_filename: str,
+    spec_content: str
+) -> DemoRunResult {
+    run = create_case_run(
+        case_id,
+        case_title,
+        design_filename,
+        design_content,
+        spec_filename,
+        spec_content
+    );
+    steps = 0;
+    while run.status == "running" and steps < 20 {
+        advance_run_node(run);
+        steps += 1;
     }
     if run.status == "running" {
-        root spawn SimulateWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn StructureFailureWalker(run_id=run_id);
-    }
-    if run.status == "running" {
-        root spawn RankHypothesesWalker(run_id=run_id);
-    }
-    while (
-        run.status == "running"
-        and run.current_state == "D3_GENERATE_ARTIFACT"
-    ) {
-        root spawn GenerateArtifactWalker(run_id=run_id);
-        if run.status == "running" {
-            root spawn ReverifyAndRenderWalker(run_id=run_id);
-        }
+        block_run(run, "Verification step limit reached", "run_case_pipeline");
     }
     return build_demo_result(run);
 }
@@ -929,14 +1072,15 @@ def generate_artifact_for_run(
         next_action=hypothesis.next_action
     );
     proposal: ArtifactProposalOutput = propose_fifo_artifact(context, top);
+    candidate = allowlisted_candidate_path();
     return make_artifact_draft(
         kind="llm_reviewed_candidate_proposal",
         description=(
             f"{proposal.description} Verification goal: "
             f"{proposal.verification_goal}"
         ),
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        candidate_path=candidate,
+        candidate_label="allowlisted_fixture:" + os.path.basename(candidate),
         hypothesis_claim=hypothesis.claim,
         notes=(
             f"{proposal.rationale} The model cannot choose or write the RTL "
@@ -946,8 +1090,23 @@ def generate_artifact_for_run(
 }
 
 # ---------------------------------------------------------------------------
-# Seven walkers
+# Eight walkers
 # ---------------------------------------------------------------------------
+
+def update_llm_job(run: Run, job: LLMJobStatus) -> None {
+    run.llm_job_kind = job.kind;
+    run.llm_job_status = job.status;
+    run.llm_job_attempt = job.attempt;
+    run.llm_job_max_attempts = job.max_attempts;
+    run.llm_job_error = job.error;
+}
+
+def finish_llm_job(run: Run) -> None {
+    if run.llm_job_id {
+        discard_llm_job(run.llm_job_id);
+    }
+    run.llm_job_id = "";
+}
 
 walker LoadInputsWalker {
     has run_id: str;
@@ -968,9 +1127,8 @@ walker LoadInputsWalker {
             if (
                 not here.input_design_path
                 or not here.input_spec_path
-                or not here.input_test_path
             ) {
-                raise ValueError("Uploaded design/spec or generated test path is missing");
+                raise ValueError("Uploaded design/spec path is missing");
             }
             module_node = here +>:OwnsModule:+> Module(
                 module_name=here.module_name,
@@ -980,8 +1138,7 @@ walker LoadInputsWalker {
             );
             evidence_ids = [
                 here.input_design_path,
-                here.input_spec_path,
-                here.input_test_path
+                here.input_spec_path
             ];
             spec: SpecLoadResult = load_uploaded_spec(
                 here.input_spec_path,
@@ -1000,12 +1157,11 @@ walker LoadInputsWalker {
             append_transition(
                 here,
                 "S0_SPEC_INGEST",
-                "S3_STATIC_CHECK",
-                "design_spec_and_test_loaded",
+                "S2_TEST_GENERATION",
+                "design_and_spec_loaded",
                 (
                     f"Loaded design module {here.module_name} and spec "
-                    f"{here.uploaded_spec_filename}; generated testbench "
-                    f"{here.testbench_name}."
+                    f"{here.uploaded_spec_filename}; test generation is ready."
                 ),
                 "tool_fact",
                 evidence_ids,
@@ -1022,6 +1178,108 @@ walker LoadInputsWalker {
                 "tool_fact",
                 ["error:load_inputs"],
                 "LoadInputsWalker"
+            );
+        }
+    }
+}
+
+walker GenerateTestbenchWalker {
+    has run_id: str;
+
+    can find_run with Root entry {
+        visit [here -->[?:Run, run_id == self.run_id]];
+    }
+
+    can generate_testbench with Run entry {
+        if here.status != "running" {
+            skip;
+        }
+        if here.current_state != "S2_TEST_GENERATION" {
+            block_run(
+                here,
+                "GenerateTestbenchWalker expected S2_TEST_GENERATION",
+                "GenerateTestbenchWalker"
+            );
+            skip;
+        }
+        try {
+            generated: GeneratedTestbench;
+            if here.test_generation_mode == "ai" {
+                if not here.llm_job_id {
+                    here.llm_job_id = start_testbench_generation_job(
+                        here.workspace_root,
+                        here.output_dir,
+                        here.input_design_path,
+                        here.input_spec_path
+                    );
+                    here.llm_job_kind = "testbench";
+                    here.llm_job_status = "queued";
+                    here.llm_job_attempt = 0;
+                    here.llm_job_error = "";
+                    here.walker_log.append(
+                        "GenerateTestbenchWalker: background LLM job queued"
+                    );
+                    skip;
+                }
+                job: LLMJobStatus = poll_llm_job(here.llm_job_id);
+                update_llm_job(here, job);
+                if job.status == "queued" or job.status == "running" or job.status == "retrying" {
+                    skip;
+                }
+                if job.status != "completed" or job.generated_testbench is None {
+                    finish_llm_job(here);
+                    raise RuntimeError(
+                        job.error if job.error else "AI testbench job failed"
+                    );
+                }
+                generated = job.generated_testbench;
+                finish_llm_job(here);
+            } else {
+                generated = generate_testbench_for_run(
+                    here.workspace_root,
+                    here.output_dir,
+                    here.input_design_path,
+                    here.input_spec_path
+                );
+            }
+            here.input_test_path = generated.path;
+            here.uploaded_test_filename = generated.filename;
+            here.testbench_name = generated.module_name;
+            here.test_generation_source = generated.mode;
+            here.test_generation_notes = generated.notes;
+            append_transition(
+                here,
+                "S2_TEST_GENERATION",
+                "S3_STATIC_CHECK",
+                "testbench_generated",
+                (
+                    f"Generated {generated.filename} via {generated.mode}; "
+                    f"top module {generated.module_name}."
+                ),
+                "model_inference" if here.test_generation_mode == "ai" else "tool_fact",
+                [
+                    f"test:{generated.path}",
+                    f"testgen:{generated.mode}"
+                ],
+                "GenerateTestbenchWalker",
+                "Generated testbench · " + generated.filename,
+                read_text_file(generated.path)
+            );
+        } except Exception as exc {
+            block_run(
+                here,
+                "GenerateTestbenchWalker failed: " + str(exc),
+                "GenerateTestbenchWalker"
+            );
+            append_transition(
+                here,
+                "S2_TEST_GENERATION",
+                "BLOCKED",
+                "testbench_generation_failed",
+                str(exc),
+                "model_inference" if here.test_generation_mode == "ai" else "tool_fact",
+                ["error:test_generation"],
+                "GenerateTestbenchWalker"
             );
         }
     }
@@ -1378,7 +1636,35 @@ walker RankHypothesesWalker {
             skip;
         }
         try {
-            drafts: list[HypothesisDraft] = rank_hypotheses_for_run(evidence);
+            drafts: list[HypothesisDraft] = [];
+            if here.llm_mode == "live" {
+                if not here.llm_job_id {
+                    here.llm_job_id = start_hypothesis_ranking_job(evidence);
+                    here.llm_job_kind = "hypotheses";
+                    here.llm_job_status = "queued";
+                    here.llm_job_attempt = 0;
+                    here.llm_job_error = "";
+                    here.walker_log.append(
+                        "RankHypothesesWalker: background LLM job queued"
+                    );
+                    skip;
+                }
+                job: LLMJobStatus = poll_llm_job(here.llm_job_id);
+                update_llm_job(here, job);
+                if job.status == "queued" or job.status == "running" or job.status == "retrying" {
+                    skip;
+                }
+                if job.status != "completed" {
+                    finish_llm_job(here);
+                    raise RuntimeError(
+                        job.error if job.error else "Hypothesis ranking job failed"
+                    );
+                }
+                drafts = job.hypotheses;
+                finish_llm_job(here);
+            } else {
+                drafts = rank_hypotheses_for_run(evidence);
+            }
             if not drafts {
                 request_user_review(
                     here,
@@ -1506,20 +1792,7 @@ walker GenerateArtifactWalker {
             );
             skip;
         }
-        if here.debug_attempt >= here.max_debug_attempts {
-            request_user_review(
-                here,
-                f"Debug attempt limit {here.max_debug_attempts} reached before artifact generation.",
-                "debug_attempt_limit_reached",
-                "policy_decision",
-                [f"attempts:{here.debug_attempt}"],
-                "GenerateArtifactWalker"
-            );
-            skip;
-        }
         top = selected[0];
-        here.debug_attempt += 1;
-        top.attempt_number = here.debug_attempt;
         draft_in = make_hypothesis_draft(
             top.rank,
             top.claim,
@@ -1531,18 +1804,89 @@ walker GenerateArtifactWalker {
             module_name = here.module_name;
         }
         try {
-            artifact_draft: ArtifactDraft = generate_artifact_for_run(
-                draft_in,
-                module_name,
-                failures[0].kind,
-                failures[0].expected,
-                failures[0].observed,
-                failures[0].cycle,
-                failures[0].raw_stdout
-            );
+            artifact_draft: ArtifactDraft;
+            if here.llm_mode == "live" {
+                if not here.llm_job_id {
+                    if here.debug_attempt >= here.max_debug_attempts {
+                        request_user_review(
+                            here,
+                            f"Debug attempt limit {here.max_debug_attempts} reached before artifact generation.",
+                            "debug_attempt_limit_reached",
+                            "policy_decision",
+                            [f"attempts:{here.debug_attempt}"],
+                            "GenerateArtifactWalker"
+                        );
+                        skip;
+                    }
+                    here.debug_attempt += 1;
+                    top.attempt_number = here.debug_attempt;
+                    here.llm_job_id = start_artifact_generation_job(
+                        draft_in,
+                        module_name
+                    );
+                    here.llm_job_kind = "artifact";
+                    here.llm_job_status = "queued";
+                    here.llm_job_attempt = 0;
+                    here.llm_job_error = "";
+                    here.walker_log.append(
+                        "GenerateArtifactWalker: background LLM job queued"
+                    );
+                    skip;
+                }
+                job: LLMJobStatus = poll_llm_job(here.llm_job_id);
+                update_llm_job(here, job);
+                if job.status == "queued" or job.status == "running" or job.status == "retrying" {
+                    skip;
+                }
+                if job.status != "completed" or job.artifact is None {
+                    finish_llm_job(here);
+                    raise RuntimeError(
+                        job.error if job.error else "Artifact generation job failed"
+                    );
+                }
+                artifact_draft = job.artifact;
+                finish_llm_job(here);
+            } else {
+                if here.debug_attempt >= here.max_debug_attempts {
+                    request_user_review(
+                        here,
+                        f"Debug attempt limit {here.max_debug_attempts} reached before artifact generation.",
+                        "debug_attempt_limit_reached",
+                        "policy_decision",
+                        [f"attempts:{here.debug_attempt}"],
+                        "GenerateArtifactWalker"
+                    );
+                    skip;
+                }
+                here.debug_attempt += 1;
+                top.attempt_number = here.debug_attempt;
+                artifact_draft = generate_artifact_for_run(
+                    draft_in,
+                    module_name,
+                    failures[0].kind,
+                    failures[0].expected,
+                    failures[0].observed,
+                    failures[0].cycle,
+                    failures[0].raw_stdout
+                );
+            }
             here.artifact_description = artifact_draft.description;
             here.candidate_label = artifact_draft.candidate_label;
             here.candidate_path = artifact_draft.candidate_path;
+            candidate_file_path: str = (
+                artifact_draft.candidate_path
+                if os.path.isabs(artifact_draft.candidate_path)
+                else os.path.join(
+                    here.workspace_root,
+                    artifact_draft.candidate_path
+                )
+            );
+            code_change: str = render_code_diff(
+                here.input_design_path,
+                candidate_file_path,
+                os.path.basename(here.input_design_path),
+                os.path.basename(candidate_file_path)
+            );
             top +>:Produces:+> Artifact(
                 kind=artifact_draft.kind,
                 description=artifact_draft.description,
@@ -1566,7 +1910,13 @@ walker GenerateArtifactWalker {
                     f"attempt:{here.debug_attempt}",
                     f"hypothesis:rank-{top.rank}"
                 ],
-                "GenerateArtifactWalker"
+                "GenerateArtifactWalker",
+                "RTL candidate diff · " + artifact_draft.candidate_label,
+                (
+                    code_change
+                    if code_change
+                    else read_text_file(candidate_file_path)
+                )
             );
         } except Exception as exc {
             request_user_review(
@@ -1652,7 +2002,12 @@ walker ReverifyAndRenderWalker {
         }
         artifact_node = artifacts[0];
 
-        # Explicit reviewed-candidate application event (fixture, not auto RTL rewrite).
+        # Publish the reviewed candidate as a run-local output before applying it.
+        here.candidate_output_path = publish_candidate_output(
+            here.workspace_root,
+            here.output_dir,
+            here.candidate_path
+        );
         here.candidate_applied = True;
         append_transition(
             here,
@@ -1661,7 +2016,11 @@ walker ReverifyAndRenderWalker {
             "reviewed_candidate_applied",
             f"Applied reviewed candidate fixture {here.candidate_label}.",
             "action_recommendation",
-            [here.candidate_label, here.candidate_path],
+            [
+                here.candidate_label,
+                here.candidate_path,
+                here.candidate_output_path
+            ],
             "ReverifyAndRenderWalker"
         );
 
@@ -1957,8 +2316,15 @@ def:pub preview_uploaded_inputs(
         spec_filename=upload_match.spec_filename,
         generated_test_filename=upload_match.generated_test_filename,
         curated_hint=(
-            "Prototype mode generates the FIFO wraparound testbench from the "
-            "uploaded spec. Automatic repair remains limited to reviewed fixtures."
+            (
+                "AI test generation is enabled through the live Firecrawl backend."
+                if testgen_mode() == "ai"
+                else (
+                    "Matched curated cases use their reviewed directed "
+                    "testbench; generic uploads use the FIFO prototype."
+                )
+            )
+            + " Automatic repair remains limited to reviewed fixtures."
         )
     );
 }
@@ -1973,6 +2339,76 @@ def:pub preview_curated_inputs -> UploadPreview {
         "fifo_spec.md",
         read_text_file(spec_path)
     );
+}
+
+def:pub start_uploaded_inputs(
+    design_filename: str,
+    design_content: str,
+    spec_filename: str,
+    spec_content: str
+) -> DemoRunResult {
+    workspace_root = os.getcwd();
+    upload_match: UploadMatch = identify_uploaded_inputs(
+        workspace_root,
+        design_filename,
+        design_content,
+        spec_filename,
+        spec_content
+    );
+    if not upload_match.accepted {
+        return rejected_upload_result(upload_match);
+    }
+    run = create_case_run(
+        upload_match.case_id,
+        upload_match.case_title,
+        upload_match.filename,
+        design_content,
+        upload_match.spec_filename,
+        spec_content
+    );
+    return build_demo_result(run);
+}
+
+def:pub start_fifo_demo -> DemoRunResult {
+    workspace_root = os.getcwd();
+    design_path = os.path.join(workspace_root, "demo", "fifo", "fifo_buggy.sv");
+    spec_path = os.path.join(workspace_root, "demo", "fifo", "fifo_spec.md");
+    return start_uploaded_inputs(
+        "fifo_buggy.sv",
+        read_text_file(design_path),
+        "fifo_spec.md",
+        read_text_file(spec_path)
+    );
+}
+
+def:pub advance_verification(run_id: str) -> DemoRunResult {
+    runs: list[Run] = [root -->[?:Run]];
+    for run in runs {
+        if run.run_id == run_id {
+            advance_run_node(run);
+            return build_demo_result(run);
+        }
+    }
+    return DemoRunResult(
+        job_id=run_id,
+        current_state="BLOCKED",
+        status="blocked",
+        transitions=[],
+        tool_evidence_available=False,
+        requirement_count=0,
+        toolchain="run lookup",
+        regression_output="",
+        reverify_output="",
+        artifact_manifest="",
+        stop_reason="Run not found: " + run_id,
+        upload_accepted=False
+    );
+}
+
+def:pub wait_for_next_poll(milliseconds: int = 1000) -> bool {
+    bounded = max(100, min(milliseconds, 2000));
+    time.sleep(float(bounded) / 1000.0);
+    return True;
 }
 
 # Upload-driven entry: the tool receives design/spec and injects a prototype test.

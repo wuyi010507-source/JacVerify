@@ -58,6 +58,14 @@ class UploadedInputPaths:
     test_module: str
 
 
+class GeneratedTestbench:
+    filename: str
+    path: str
+    module_name: str
+    mode: str
+    notes: str
+
+
 class HypothesisDraft:
     rank: int
     claim: str
@@ -72,6 +80,18 @@ class ArtifactDraft:
     candidate_label: str
     hypothesis_claim: str
     notes: str
+
+
+class LLMJobStatus:
+    job_id: str
+    kind: str
+    status: str
+    attempt: int
+    max_attempts: int
+    error: str
+    generated_testbench: GeneratedTestbench | None
+    hypotheses: list[HypothesisDraft]
+    artifact: ArtifactDraft | None
 
 
 class FifoSuiteEvidence:
@@ -89,6 +109,7 @@ ToolRun = ToolResult
 def tools_mode() -> str: ...
 def llm_mode() -> str: ...
 def llm_backend() -> str: ...
+def testgen_mode() -> str: ...
 def load_spec(workspace_root: str) -> SpecLoadResult: ...
 def load_uploaded_spec(
     spec_path: str, module_path: str, module_name: str
@@ -124,6 +145,12 @@ def materialize_uploaded_inputs(
     spec_filename: str,
     spec_content: str,
 ) -> UploadedInputPaths: ...
+def generate_testbench_for_run(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> GeneratedTestbench: ...
 def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None: ...
 def parse_failure_from_stored(
     *,
@@ -137,6 +164,18 @@ def rank_hypotheses(failure: FailureEvidence) -> list[HypothesisDraft]: ...
 def generate_artifact(
     hypothesis: HypothesisDraft, module_name: str
 ) -> ArtifactDraft: ...
+def start_testbench_generation_job(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> str: ...
+def start_hypothesis_ranking_job(failure: FailureEvidence) -> str: ...
+def start_artifact_generation_job(
+    hypothesis: HypothesisDraft, module_name: str
+) -> str: ...
+def poll_llm_job(job_id: str) -> LLMJobStatus: ...
+def discard_llm_job(job_id: str) -> None: ...
 def rank_hypotheses_mock(failure: FailureEvidence) -> list[HypothesisDraft]: ...
 def rank_hypotheses_firecrawl(
     failure: FailureEvidence,
@@ -172,6 +211,23 @@ class UploadMatch:
     generated_test_filename: str
 
 
+def set_active_case(case_id: str) -> str: ...
+def get_active_case_id() -> str: ...
+def is_curated_case_id(case_id: str) -> bool: ...
+def allowlisted_candidate_path(case_id: str = "") -> str: ...
+def read_text_file(path: str) -> str: ...
+def render_code_diff(
+    before_path: str,
+    after_path: str,
+    before_label: str = "before",
+    after_label: str = "after",
+) -> str: ...
+def publish_candidate_output(
+    workspace_root: str,
+    output_dir: str,
+    candidate_path: str,
+) -> str: ...
+def text_file_data_url(path: str) -> str: ...
 def identify_uploaded_case(
     workspace_root: str, filename: str, content: str
 ) -> UploadMatch: ...

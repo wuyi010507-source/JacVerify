@@ -119,7 +119,7 @@ test "state executor completes an evidence-labelled FIFO debug loop" {
     assert transitions[9].to_state == "DONE";
 }
 
-test "seven walkers mock pipeline reaches DONE with structured evidence" {
+test "walker pipeline reaches DONE with generated-test evidence" {
     first_run = run_fifo_demo();
     second_run = run_fifo_demo();
 
@@ -143,6 +143,8 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert not first_run.needs_user_review;
     assert first_run.uploaded_spec_filename == "fifo_spec.md";
     assert first_run.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert first_run.test_generation_mode == "hardcoded";
+    assert first_run.test_generation_source == "hardcoded:fifo";
     assert first_run.coverage_available;
     assert first_run.code_coverage == 91.0;
     assert first_run.functional_coverage == 100.0;
@@ -151,9 +153,18 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert first_run.tool_evidence_available;
     assert "WRAP_MISMATCH" in first_run.regression_output;
     assert "WRAP_TEST_PASS" in first_run.reverify_output;
+    assert len(first_run.output_files) == 2;
+    assert first_run.output_files[0].kind == "GENERATED TESTBENCH";
+    assert first_run.output_files[0].filename == "generated_tb_wrap.sv";
+    assert first_run.output_files[0].download_href.startswith("data:text/plain");
+    assert first_run.output_files[1].kind == "REPAIRED RTL";
+    assert first_run.output_files[1].filename == "fifo_fixed.sv";
+    assert first_run.output_files[1].relative_path == "outputs/fifo_fixed.sv";
+    assert "module fifo" in first_run.output_files[1].content;
 
     expected_walkers = [
         "LoadInputsWalker",
+        "GenerateTestbenchWalker",
         "CompileWalker",
         "SimulateWalker",
         "StructureFailureWalker",
@@ -170,10 +181,23 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     for name in expected_walkers {
         assert name in walker_names;
     }
+    code_transitions = [
+        transition
+        for transition in first_run.transitions
+        if transition.code_change_content
+    ];
+    assert len(code_transitions) == 2;
+    assert code_transitions[0].event == "testbench_generated";
+    assert "module tb_wrap" in code_transitions[0].code_change_content;
+    assert code_transitions[1].event == "artifact_generated";
+    assert "--- fifo_buggy.sv" in code_transitions[1].code_change_content;
+    assert "+++ fifo_fixed.sv" in code_transitions[1].code_change_content;
 
     runs: list[Run] = [root -->[?:Run, run_id == first_run.job_id]];
     assert len(runs) == 1;
     run = runs[0];
+    assert os.path.isfile(run.candidate_output_path);
+    assert run.candidate_output_path.endswith("outputs/fifo_fixed.sv");
     assert len([run ->:OwnsRequirement:->]) == 5;
     assert len([run ->:OwnsModule:->]) == 1;
     executed_tests: list[Test] = [run ->:Executes:->];
@@ -189,6 +213,41 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     arts = [hyps[0] ->:Produces:->];
     assert len(arts) == 1;
     assert len([arts[0] ->:ReverifiedBy:->]) == 1;
+}
+
+test "step endpoint exposes live progress between walkers" {
+    started = start_fifo_demo();
+    assert started.status == "running";
+    assert started.current_state == "S0_SPEC_INGEST";
+    assert len(started.transitions) == 0;
+
+    loaded = advance_verification(started.job_id);
+    assert loaded.current_state == "S2_TEST_GENERATION";
+    assert loaded.walker_log[-1] == "LoadInputsWalker";
+
+    generated = advance_verification(started.job_id);
+    assert generated.current_state == "S3_STATIC_CHECK";
+    assert generated.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert generated.walker_log[-1] == "GenerateTestbenchWalker";
+
+    compiled = advance_verification(started.job_id);
+    assert compiled.current_state == "S4_COMPILE_ELAB";
+
+    simulated = advance_verification(started.job_id);
+    assert simulated.current_state == "D0_FAILURE_NORMALIZE";
+
+    structured = advance_verification(started.job_id);
+    assert structured.current_state == "D1_HYPOTHESIS_RANK";
+
+    ranked = advance_verification(started.job_id);
+    assert ranked.current_state == "D3_GENERATE_ARTIFACT";
+
+    artifact = advance_verification(started.job_id);
+    assert artifact.current_state == "D4_APPLY_CANDIDATE";
+
+    finished = advance_verification(started.job_id);
+    assert finished.status == "complete";
+    assert finished.current_state == "DONE";
 }
 
 test "debug loop rejects two hypotheses then succeeds on attempt three" {

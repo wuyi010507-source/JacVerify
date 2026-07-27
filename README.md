@@ -2,10 +2,11 @@
 
 Graph-native, evidence-driven chip verification orchestrator built with Jac and open-source EDA tools.
 
-The P0 demo is a seven-walker FIFO wraparound pipeline:
+The P0 demo is an eight-walker FIFO wraparound pipeline:
 
 ```text
 LoadInputsWalker
+→ GenerateTestbenchWalker
 → CompileWalker
 → SimulateWalker
 → StructureFailureWalker
@@ -25,6 +26,7 @@ next one. Three failures—or any unknown/tool-error condition—stop at
 |---|---|---|
 | `JACVERIFY_MOCK_TOOLS` | Deterministic mock tool adapters | Live Icarus Verilog (`iverilog` / `vvp`) |
 | `JACVERIFY_MOCK_LLM` | Deterministic mock diagnosis / artifact | Live adapter selected by `JACVERIFY_LLM_BACKEND` |
+| `JACVERIFY_AI_TESTGEN` | AI-generated testbench | Hardcoded reviewed FIFO testbench |
 
 The current experimental live backend is Firecrawl Agent (`spark-1-mini`).
 Jac byLLM remains available as the fallback backend.
@@ -68,6 +70,7 @@ jac install
 
 JACVERIFY_MOCK_TOOLS=1 \
 JACVERIFY_MOCK_LLM=1 \
+JACVERIFY_AI_TESTGEN=0 \
 jac start --dev main.jac
 ```
 
@@ -78,13 +81,55 @@ Upload path (product UX):
 1. Choose an RTL module in **Design RTL**.
 2. Choose its requirements document in **Specification**.
 3. Click **Run verification loop**, or use the curated FIFO design/spec pair.
+   Matching curated pairs also work for `demo/alu` and `demo/shift_reg`.
 4. Inspect the graph evidence at [http://localhost:8000/graph](http://localhost:8000/graph).
 
 The design and spec are saved under that run's isolated
-`runs/<run-id>/inputs/` directory. The current prototype generates
-`generated_tb_wrap.sv` from the checked-in FIFO wraparound test fixture; this
-hardcoded step will later be replaced by spec-driven generation. Automatic
-candidate application remains restricted to reviewed fixtures.
+`runs/<run-id>/inputs/` directory. With `JACVERIFY_AI_TESTGEN=0`, the prototype
+uses the matched curated case's reviewed directed testbench (FIFO, ALU, or
+shift-register); unmatched uploads retain the FIFO prototype fallback. With
+`JACVERIFY_AI_TESTGEN=1`, the live Firecrawl backend receives the uploaded
+design and spec and writes `generated_ai_testbench.sv`. Automatic candidate
+application remains restricted to reviewed fixtures.
+
+The browser starts a run, then polls the workflow once per second. LLM-backed
+walkers submit background jobs, so `advance_verification` returns immediately
+with `queued`, `running`, `retrying`, `completed`, or `failed` job state. Each
+Firecrawl attempt defaults to a 45-second timeout and one retry; exhausted jobs
+stop at `NEEDS_USER_REVIEW` with the error recorded on the run.
+
+## AI-generated testbench mode
+
+```bash
+JACVERIFY_MOCK_TOOLS=0 \
+JACVERIFY_MOCK_LLM=0 \
+JACVERIFY_AI_TESTGEN=1 \
+JACVERIFY_LLM_BACKEND=firecrawl \
+JACVERIFY_LLM_TIMEOUT_SECONDS=45 \
+JACVERIFY_LLM_RETRIES=1 \
+JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS=1 \
+FIRECRAWL_API_KEY=... \
+jac start --dev main.jac
+```
+
+`JACVERIFY_LLM_RETRIES=1` means one retry after the first attempt (two attempts
+total). Set it to `0` to fail the stage immediately after the 45-second
+timeout.
+
+AI-generated testbenches are compiled with `iverilog -g2012` before the
+workflow advances. On a syntax failure, JacVerify sends the compiler diagnostics
+and invalid testbench back to the model for one repair attempt by default.
+
+The generated testbench must be self-contained and use the bounded output
+protocol requested by JacVerify:
+
+```text
+JACVERIFY_TEST_PASS
+JACVERIFY_FAILURE kind=<TOKEN> expected=<TOKEN> observed=<TOKEN> cycle=<N>
+```
+
+The simulator remains authoritative. AI output is compiled and executed like
+any other testbench; generation alone can never produce a PASS verdict.
 
 Coverage is optional and generated-test-owned. A testbench can publish both
 metrics with:
@@ -113,7 +158,7 @@ inference. Use `--live-tools` only after that succeeds.
 Requires Icarus Verilog (verified with 12.0):
 
 ```bash
-brew install icarus-verilog
+brew install icarus-verilog   # once, locally
 
 JACVERIFY_MOCK_TOOLS=0 \
 JACVERIFY_MOCK_LLM=1 \
@@ -145,6 +190,7 @@ the response to select an RTL path or produce a verification PASS.
 ```bash
 JACVERIFY_MOCK_TOOLS=1 \
 JACVERIFY_MOCK_LLM=1 \
+JACVERIFY_AI_TESTGEN=0 \
 JAC_DATA_PATH="$(mktemp -d)" \
 jac test jacverify/store.jac -v
 
@@ -155,10 +201,10 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/test_tool_adapter.py -q
 
 ## What is live vs mocked
 
-- **Always Jac-orchestrated:** seven walkers, graph nodes/edges, transition records.
+- **Always Jac-orchestrated:** eight walkers, graph nodes/edges, transition records.
 - **Tools:** mock `ToolResult` values when `JACVERIFY_MOCK_TOOLS=1`; otherwise Icarus compiles the uploaded design with the prototype generated test.
 - **LLM:** deterministic outputs in mock mode; Firecrawl Agent is the current experimental live adapter, with typed Jac byLLM retained as an alternative.
-- **Fixed RTL:** `demo/fifo/fifo_fixed.sv` is a **pre-reviewed candidate fixture**, not an LLM-authored patch. Re-verification PASS comes only from the simulator `ToolResult`.
+- **Fixed RTL:** `demo/*/…_fixed.sv` files are **pre-reviewed candidate fixtures**, not LLM-authored patches. Re-verification PASS comes only from the simulator `ToolResult`.
 
 ## Architecture
 
@@ -174,8 +220,10 @@ Dashboard / run_uploaded_inputs
 Important entrypoints:
 
 - `main.jac` — full-stack entry
-- `jacverify/store.jac` — graph model, seven walkers, endpoints
+- `jacverify/store.jac` — graph model, eight walkers, stepwise endpoints
 - `jacverify/llm_calls.jac` — two constrained, typed byLLM declarations
 - `jacverify/tool_adapter.py` — shared `ToolResult` + mock/live adapters
-- `demo/fifo/` — buggy/fixed RTL, hardcoded prototype tests, five requirements
+- `demo/fifo/` — FIFO wraparound curated case
+- `demo/alu/` — ALU SUB-opcode curated case
+- `demo/shift_reg/` — shift-register direction curated case
 - `Documents/JacVerify_LLM功能现状.md` — current LLM scope, setup, and remaining work
