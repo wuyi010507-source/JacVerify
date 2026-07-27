@@ -482,6 +482,46 @@ h1 {
   border: 1px solid var(--line);
 }
 
+.live-progress {
+  border: 1px solid rgba(101, 230, 255, 0.48);
+  background:
+    linear-gradient(90deg, rgba(101, 230, 255, 0.08), transparent 58%),
+    rgba(7, 17, 31, 0.94);
+  padding: 18px;
+  margin-bottom: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.live-progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.live-progress-heading h3 {
+  margin: 3px 0 0;
+}
+
+.live-progress-heading > strong {
+  color: var(--cyan);
+  font: 22px/1 "DM Mono", monospace;
+}
+
+.live-progress progress {
+  width: 100%;
+  height: 9px;
+  border: 0;
+  background: #14273a;
+  accent-color: var(--cyan);
+}
+
+.live-progress small {
+  color: var(--muted);
+  font: 10px/1.5 "DM Mono", monospace;
+}
+
 .run-summary > div {
   padding: 18px;
   border-right: 1px solid var(--line);

@@ -8,12 +8,15 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 STATUS_PASSED = "PASSED"
 STATUS_VERIFICATION_FAILED = "VERIFICATION_FAILED"
@@ -23,6 +26,10 @@ STATUS_NOT_RUN = "NOT_RUN"
 
 WRAP_MISMATCH_RE = re.compile(
     r"WRAP_MISMATCH\s+expected=([0-9A-Fa-f]+)\s+observed=([0-9A-Fa-f]+)"
+)
+GENERIC_FAILURE_RE = re.compile(
+    r"JACVERIFY_FAILURE\s+kind=(\S+)\s+expected=(\S+)\s+observed=(\S+)"
+    r"(?:\s+cycle=(\d+))?"
 )
 COVERAGE_RE = re.compile(
     r"JACVERIFY_COVERAGE\s+code=([0-9]+(?:\.[0-9]+)?)"
@@ -88,6 +95,28 @@ class UploadedInputPaths:
     test_module: str
 
 
+@dataclass(frozen=True)
+class GeneratedTestbench:
+    filename: str
+    path: str
+    module_name: str
+    mode: str
+    notes: str
+
+
+@dataclass(frozen=True)
+class LLMJobStatus:
+    job_id: str
+    kind: str
+    status: str
+    attempt: int
+    max_attempts: int
+    error: str
+    generated_testbench: GeneratedTestbench | None = None
+    hypotheses: list[HypothesisDraft] = field(default_factory=list)
+    artifact: ArtifactDraft | None = None
+
+
 # Backward-compatible aliases used by older tests during migration.
 ToolRun = ToolResult
 
@@ -115,6 +144,11 @@ def llm_mode() -> str:
 def llm_backend() -> str:
     """Select the live inference adapter without affecting deterministic mock mode."""
     return os.environ.get("JACVERIFY_LLM_BACKEND", "firecrawl").strip().lower()
+
+
+def testgen_mode() -> str:
+    """Select AI test generation without changing the existing LLM mode."""
+    return "ai" if os.environ.get("JACVERIFY_AI_TESTGEN", "0") == "1" else "hardcoded"
 
 
 def _tool_error(
@@ -228,6 +262,16 @@ def parse_failure_evidence(result: ToolResult) -> FailureEvidence | None:
             expected=match.group(1),
             observed=match.group(2),
             cycle=None,
+            raw_stdout=result.stdout,
+            source_result=result,
+        )
+    generic = GENERIC_FAILURE_RE.search(result.stdout or "")
+    if generic:
+        return FailureEvidence(
+            kind=generic.group(1),
+            expected=generic.group(2),
+            observed=generic.group(3),
+            cycle=int(generic.group(4)) if generic.group(4) else None,
             raw_stdout=result.stdout,
             source_result=result,
         )
@@ -495,29 +539,217 @@ def materialize_uploaded_inputs(
     spec_filename: str,
     spec_content: str,
 ) -> UploadedInputPaths:
-    """Write design/spec inputs and inject the prototype generated testbench."""
+    """Write design/spec inputs; test generation is a separate pipeline stage."""
     inputs_dir = _ensure_output_dir(output_dir) / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     design_name = _safe_upload_name(design_filename, "design.sv")
     spec_name = _safe_upload_name(spec_filename, "spec.md")
-    test_name = "generated_tb_wrap.sv"
     design_path = inputs_dir / design_name
     spec_path = inputs_dir / spec_name
-    test_path = inputs_dir / test_name
     normalized_design = normalize_source(design_content)
     normalized_spec = normalize_source(spec_content)
-    normalized_test = normalize_source(
-        _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
-    )
     design_path.write_text(normalized_design, encoding="utf-8")
     spec_path.write_text(normalized_spec, encoding="utf-8")
-    test_path.write_text(normalized_test, encoding="utf-8")
     return UploadedInputPaths(
         design_path=str(design_path),
         spec_path=str(spec_path),
-        test_path=str(test_path),
+        test_path="",
         design_module=_module_name(normalized_design, "Uploaded design"),
-        test_module=_module_name(normalized_test, "Generated testbench"),
+        test_module="",
+    )
+
+
+def _strip_code_fence(source: str) -> str:
+    text = source.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines:
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _write_generated_testbench(
+    output_dir: str,
+    filename: str,
+    source: str,
+    *,
+    mode: str,
+    notes: str,
+) -> GeneratedTestbench:
+    inputs_dir = _ensure_output_dir(output_dir) / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    path = inputs_dir / _safe_upload_name(filename, "generated_testbench.sv")
+    normalized = normalize_source(_strip_code_fence(source))
+    module_name = _module_name(normalized, "Generated testbench")
+    path.write_text(normalized, encoding="utf-8")
+    return GeneratedTestbench(
+        filename=path.name,
+        path=str(path),
+        module_name=module_name,
+        mode=mode,
+        notes=notes,
+    )
+
+
+def generate_testbench_for_run(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> GeneratedTestbench:
+    """Generate a run-local testbench using AI or the hardcoded prototype."""
+    if testgen_mode() == "hardcoded":
+        source = _fifo_paths(workspace_root)["wrap_tb"].read_text(encoding="utf-8")
+        return _write_generated_testbench(
+            output_dir,
+            "generated_tb_wrap.sv",
+            source,
+            mode="hardcoded",
+            notes="Copied from the reviewed FIFO wraparound test fixture.",
+        )
+
+    if llm_mode() != "live":
+        raise RuntimeError(
+            "AI test generation requires JACVERIFY_MOCK_LLM=0"
+        )
+    backend = llm_backend()
+    if backend != "firecrawl":
+        raise RuntimeError(
+            "AI test generation currently supports JACVERIFY_LLM_BACKEND=firecrawl"
+        )
+
+    design = Path(design_path).read_text(encoding="utf-8")
+    spec = Path(spec_path).read_text(encoding="utf-8")
+    prompt = f"""
+Act as a SystemVerilog verification engineer. Generate one complete,
+self-contained SystemVerilog testbench for the supplied design and
+specification.
+
+Rules:
+- Return code in the testbench field without Markdown fences.
+- Target Icarus Verilog with -g2012 and use conservative testbench syntax.
+- Instantiate the exact DUT module and connect its declared ports.
+- Include a clock/reset sequence when the interface needs one.
+- Exercise the most important requirements with bounded directed stimulus.
+- On success print JACVERIFY_TEST_PASS and finish with exit code 0.
+- On a detected mismatch print exactly:
+  JACVERIFY_FAILURE kind=<TOKEN> expected=<TOKEN> observed=<TOKEN> cycle=<N>
+  then call $fatal(1).
+- Do not use UVM, external files, DPI, shell commands, or unbounded loops.
+- Use begin/end for procedural blocks, never C-style braces.
+- Call tasks with positional arguments, never named arguments.
+- Do not use queues, dynamic arrays, classes, interfaces, program blocks,
+  clocking blocks, parameter-sized casts, or unsupported assertion syntax.
+- Prefer fixed-size arrays, integer loop variables declared at module scope,
+  and plain Verilog-compatible tasks.
+
+SPECIFICATION:
+{spec[:2500]}
+
+DESIGN:
+{design[:6500]}
+""".strip()
+    data = _firecrawl_agent(
+        prompt=prompt,
+        schema={
+            "type": "object",
+            "properties": {
+                "testbench": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["testbench", "notes"],
+            "additionalProperties": False,
+        },
+    )
+    source = str(data.get("testbench", "")).strip()
+    if not source:
+        raise RuntimeError("AI test generation returned an empty testbench")
+    notes = str(data.get("notes", "")).strip()[:1000]
+    generated = _write_generated_testbench(
+        output_dir,
+        "generated_ai_testbench.sv",
+        source,
+        mode="ai:firecrawl",
+        notes=notes,
+    )
+    validation = lint_compile(
+        workspace_root,
+        output_dir,
+        design_path,
+        generated.path,
+        generated.module_name,
+    )
+    repair_attempts = int(
+        os.environ.get("JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS", "1")
+    )
+    if not 0 <= repair_attempts <= 2:
+        raise RuntimeError("JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS must be 0..2")
+
+    for repair_attempt in range(1, repair_attempts + 1):
+        if validation.status == STATUS_PASSED:
+            return generated
+        compile_error = (validation.stderr or validation.stdout).strip()
+        repair_data = _firecrawl_agent(
+            prompt=f"""
+Repair the SystemVerilog testbench below so that this command succeeds:
+iverilog -g2012 -s {generated.module_name} DESIGN TESTBENCH
+
+Return the complete replacement testbench only in the testbench field.
+Preserve the DUT ports and JACVERIFY_TEST_PASS / JACVERIFY_FAILURE protocol.
+Use conservative Icarus-compatible syntax: begin/end procedural blocks,
+positional task calls, fixed-size arrays, and no queues, dynamic arrays,
+classes, interfaces, named task arguments, parameter-sized casts, or
+unsupported assertions.
+
+IVERILOG ERRORS:
+{compile_error[:3500]}
+
+DESIGN:
+{design[:6500]}
+
+INVALID TESTBENCH:
+{source[:9000]}
+""".strip(),
+            schema={
+                "type": "object",
+                "properties": {
+                    "testbench": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["testbench", "notes"],
+                "additionalProperties": False,
+            },
+        )
+        source = str(repair_data.get("testbench", "")).strip()
+        if not source:
+            raise RuntimeError("AI testbench repair returned empty source")
+        generated = _write_generated_testbench(
+            output_dir,
+            "generated_ai_testbench.sv",
+            source,
+            mode="ai:firecrawl",
+            notes=(
+                f"{notes} Auto-repaired after compile failure "
+                f"(attempt {repair_attempt})."
+            ).strip()[:1000],
+        )
+        validation = lint_compile(
+            workspace_root,
+            output_dir,
+            design_path,
+            generated.path,
+            generated.module_name,
+        )
+
+    if validation.status == STATUS_PASSED:
+        return generated
+    compile_error = (validation.stderr or validation.stdout).strip()
+    raise RuntimeError(
+        "AI-generated testbench did not compile after "
+        f"{repair_attempts} repair attempt(s): {compile_error[:2000]}"
     )
 
 
@@ -872,7 +1104,7 @@ def run_reverify(
         "candidate_kind": "reviewed_fixture",
         "test": str(testbench),
     }
-    if result.status == STATUS_PASSED and "WRAP_TEST_PASS" in result.stdout:
+    if result.status == STATUS_PASSED and result.exit_code == 0:
         return ToolResult(
             tool=result.tool,
             mode=result.mode,
@@ -1000,7 +1232,10 @@ def _firecrawl_agent(
     model = os.environ.get("JACVERIFY_FIRECRAWL_MODEL", "spark-1-mini").strip()
     max_credits = int(os.environ.get("JACVERIFY_FIRECRAWL_MAX_CREDITS", "100"))
     timeout_seconds = int(
-        os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "60")
+        os.environ.get(
+            "JACVERIFY_LLM_TIMEOUT_SECONDS",
+            os.environ.get("JACVERIFY_FIRECRAWL_TIMEOUT_SECONDS", "45"),
+        )
     )
     poll_seconds = float(
         os.environ.get("JACVERIFY_FIRECRAWL_POLL_SECONDS", "2")
@@ -1019,6 +1254,8 @@ def _firecrawl_agent(
         "User-Agent": "JacVerify/0.1",
     }
 
+    deadline = time.monotonic() + timeout_seconds
+
     def request_json(
         url: str,
         *,
@@ -1036,8 +1273,15 @@ def _firecrawl_agent(
             headers=headers,
             method=method,
         )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Firecrawl agent timed out after {timeout_seconds}s"
+            )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(
+                request, timeout=max(1.0, min(20.0, remaining))
+            ) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
@@ -1068,7 +1312,6 @@ def _firecrawl_agent(
             f"Firecrawl did not start an agent job: {started.get('error', started)}"
         )
 
-    deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = request_json(f"{base_url}/agent/{job_id}", method="GET")
         state = status.get("status")
@@ -1083,9 +1326,9 @@ def _firecrawl_agent(
             )
         if state != "processing":
             raise RuntimeError(f"Unexpected Firecrawl agent status: {state!r}")
-        time.sleep(poll_seconds)
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
-    raise RuntimeError(
+    raise TimeoutError(
         f"Firecrawl agent timed out after {timeout_seconds}s"
     )
 
@@ -1270,6 +1513,139 @@ def generate_artifact(
         "generate_artifact_for_run in jacverify/store.jac. This Python adapter "
         "only owns the deterministic mock implementation."
     )
+
+
+_LLM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("JACVERIFY_LLM_WORKERS", "4")),
+    thread_name_prefix="jacverify-llm",
+)
+_LLM_JOBS: dict[str, dict[str, Any]] = {}
+_LLM_JOBS_LOCK = threading.Lock()
+
+
+def _llm_max_attempts() -> int:
+    retries = int(os.environ.get("JACVERIFY_LLM_RETRIES", "1"))
+    if not 0 <= retries <= 3:
+        raise RuntimeError("JACVERIFY_LLM_RETRIES must be 0..3")
+    return retries + 1
+
+
+def _run_llm_job(job_id: str, operation: Callable[[], Any]) -> None:
+    with _LLM_JOBS_LOCK:
+        max_attempts = int(_LLM_JOBS[job_id]["max_attempts"])
+    for attempt in range(1, max_attempts + 1):
+        with _LLM_JOBS_LOCK:
+            job = _LLM_JOBS[job_id]
+            job["status"] = "running"
+            job["attempt"] = attempt
+            job["error"] = ""
+        try:
+            result = operation()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with _LLM_JOBS_LOCK:
+                job = _LLM_JOBS[job_id]
+                job["error"] = error
+                job["status"] = (
+                    "retrying" if attempt < max_attempts else "failed"
+                )
+            if attempt < max_attempts:
+                time.sleep(
+                    float(os.environ.get("JACVERIFY_LLM_RETRY_DELAY_SECONDS", "1"))
+                )
+                continue
+            return
+        with _LLM_JOBS_LOCK:
+            job = _LLM_JOBS[job_id]
+            job["result"] = result
+            job["status"] = "completed"
+        return
+
+
+def _start_llm_job(kind: str, operation: Callable[[], Any]) -> str:
+    job_id = f"{kind}-{uuid.uuid4().hex}"
+    with _LLM_JOBS_LOCK:
+        _LLM_JOBS[job_id] = {
+            "kind": kind,
+            "status": "queued",
+            "attempt": 0,
+            "max_attempts": _llm_max_attempts(),
+            "error": "",
+            "result": None,
+        }
+    _LLM_EXECUTOR.submit(_run_llm_job, job_id, operation)
+    return job_id
+
+
+def start_testbench_generation_job(
+    workspace_root: str,
+    output_dir: str,
+    design_path: str,
+    spec_path: str,
+) -> str:
+    return _start_llm_job(
+        "testbench",
+        lambda: generate_testbench_for_run(
+            workspace_root, output_dir, design_path, spec_path
+        ),
+    )
+
+
+def start_hypothesis_ranking_job(failure: FailureEvidence) -> str:
+    return _start_llm_job(
+        "hypotheses",
+        lambda: rank_hypotheses(failure),
+    )
+
+
+def start_artifact_generation_job(
+    hypothesis: HypothesisDraft, module_name: str
+) -> str:
+    return _start_llm_job(
+        "artifact",
+        lambda: generate_artifact(hypothesis, module_name),
+    )
+
+
+def poll_llm_job(job_id: str) -> LLMJobStatus:
+    with _LLM_JOBS_LOCK:
+        job = _LLM_JOBS.get(job_id)
+        if job is None:
+            return LLMJobStatus(
+                job_id=job_id,
+                kind="unknown",
+                status="failed",
+                attempt=0,
+                max_attempts=0,
+                error=(
+                    "Background LLM job was lost, likely because the service "
+                    "restarted while it was running."
+                ),
+            )
+        result = job["result"]
+        kind = str(job["kind"])
+        return LLMJobStatus(
+            job_id=job_id,
+            kind=kind,
+            status=str(job["status"]),
+            attempt=int(job["attempt"]),
+            max_attempts=int(job["max_attempts"]),
+            error=str(job["error"]),
+            generated_testbench=(
+                result if kind == "testbench" and result is not None else None
+            ),
+            hypotheses=(
+                result if kind == "hypotheses" and result is not None else []
+            ),
+            artifact=(
+                result if kind == "artifact" and result is not None else None
+            ),
+        )
+
+
+def discard_llm_job(job_id: str) -> None:
+    with _LLM_JOBS_LOCK:
+        _LLM_JOBS.pop(job_id, None)
 
 
 def make_failure_evidence(
@@ -1459,6 +1835,16 @@ def identify_uploaded_inputs(
     """Validate design/spec inputs and recognize optional curated fixtures."""
     design_basename = _safe_upload_name(design_filename, "design.sv")
     spec_basename = _safe_upload_name(spec_filename, "spec.md")
+    generated_name = (
+        "generated_ai_testbench.sv"
+        if testgen_mode() == "ai"
+        else "generated_tb_wrap.sv"
+    )
+    generation_description = (
+        "an AI-generated Firecrawl testbench"
+        if testgen_mode() == "ai"
+        else "the prototype generated FIFO testbench"
+    )
     if not design_content or not design_content.strip():
         return UploadMatch(
             accepted=False,
@@ -1467,6 +1853,7 @@ def identify_uploaded_inputs(
             message="Upload an RTL design file to continue.",
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
     if not spec_content or not spec_content.strip():
         return UploadMatch(
@@ -1476,6 +1863,7 @@ def identify_uploaded_inputs(
             message="Upload a specification file to continue.",
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
     try:
         _module_name(design_content, "Uploaded design")
@@ -1487,6 +1875,7 @@ def identify_uploaded_inputs(
             message=str(exc),
             filename=design_basename,
             spec_filename=spec_basename,
+            generated_test_filename=generated_name,
         )
 
     design_fp = source_fingerprint(design_content)
@@ -1507,11 +1896,12 @@ def identify_uploaded_inputs(
                 case_title=case.title,
                 message=(
                     f"Ready: `{design_basename}` and `{spec_basename}` match "
-                    "the reviewed FIFO fixture. JacVerify will generate the "
-                    "prototype wraparound testbench."
+                    "the reviewed FIFO fixture. JacVerify will use "
+                    f"{generation_description}."
                 ),
                 filename=design_basename,
                 spec_filename=spec_basename,
+                generated_test_filename=generated_name,
             )
 
     return UploadMatch(
@@ -1520,10 +1910,11 @@ def identify_uploaded_inputs(
         case_title="Spec-driven design verification",
         message=(
             f"Ready: `{design_basename}` will be checked against "
-            f"`{spec_basename}` using the prototype generated FIFO testbench."
+            f"`{spec_basename}` using {generation_description}."
         ),
         filename=design_basename,
         spec_filename=spec_basename,
+        generated_test_filename=generated_name,
     )
 
 

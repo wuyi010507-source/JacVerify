@@ -119,7 +119,7 @@ test "state executor completes an evidence-labelled FIFO debug loop" {
     assert transitions[9].to_state == "DONE";
 }
 
-test "seven walkers mock pipeline reaches DONE with structured evidence" {
+test "walker pipeline reaches DONE with generated-test evidence" {
     first_run = run_fifo_demo();
     second_run = run_fifo_demo();
 
@@ -143,6 +143,8 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     assert not first_run.needs_user_review;
     assert first_run.uploaded_spec_filename == "fifo_spec.md";
     assert first_run.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert first_run.test_generation_mode == "hardcoded";
+    assert first_run.test_generation_source == "hardcoded";
     assert first_run.coverage_available;
     assert first_run.code_coverage == 91.0;
     assert first_run.functional_coverage == 100.0;
@@ -154,6 +156,7 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
 
     expected_walkers = [
         "LoadInputsWalker",
+        "GenerateTestbenchWalker",
         "CompileWalker",
         "SimulateWalker",
         "StructureFailureWalker",
@@ -189,6 +192,41 @@ test "seven walkers mock pipeline reaches DONE with structured evidence" {
     arts = [hyps[0] ->:Produces:->];
     assert len(arts) == 1;
     assert len([arts[0] ->:ReverifiedBy:->]) == 1;
+}
+
+test "step endpoint exposes live progress between walkers" {
+    started = start_fifo_demo();
+    assert started.status == "running";
+    assert started.current_state == "S0_SPEC_INGEST";
+    assert len(started.transitions) == 0;
+
+    loaded = advance_verification(started.job_id);
+    assert loaded.current_state == "S2_TEST_GENERATION";
+    assert loaded.walker_log[-1] == "LoadInputsWalker";
+
+    generated = advance_verification(started.job_id);
+    assert generated.current_state == "S3_STATIC_CHECK";
+    assert generated.uploaded_test_filename == "generated_tb_wrap.sv";
+    assert generated.walker_log[-1] == "GenerateTestbenchWalker";
+
+    compiled = advance_verification(started.job_id);
+    assert compiled.current_state == "S4_COMPILE_ELAB";
+
+    simulated = advance_verification(started.job_id);
+    assert simulated.current_state == "D0_FAILURE_NORMALIZE";
+
+    structured = advance_verification(started.job_id);
+    assert structured.current_state == "D1_HYPOTHESIS_RANK";
+
+    ranked = advance_verification(started.job_id);
+    assert ranked.current_state == "D3_GENERATE_ARTIFACT";
+
+    artifact = advance_verification(started.job_id);
+    assert artifact.current_state == "D4_APPLY_CANDIDATE";
+
+    finished = advance_verification(started.job_id);
+    assert finished.status == "complete";
+    assert finished.current_state == "DONE";
 }
 
 test "debug loop rejects two hypotheses then succeeds on attempt three" {

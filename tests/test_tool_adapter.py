@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from jacverify.tool_adapter import (
     STATUS_VERIFICATION_FAILED,
     coverage_from_result,
     generate_artifact,
+    generate_testbench_for_run,
     identify_uploaded_case,
     identify_uploaded_inputs,
     lint_compile,
@@ -30,6 +33,7 @@ from jacverify.tool_adapter import (
 def _mock_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JACVERIFY_MOCK_TOOLS", "1")
     monkeypatch.setenv("JACVERIFY_MOCK_LLM", "1")
+    monkeypatch.setenv("JACVERIFY_AI_TESTGEN", "0")
     monkeypatch.delenv("JACVERIFY_FORCE_BUG_NOT_REPRODUCED", raising=False)
     monkeypatch.delenv("JACVERIFY_FORCE_REVERIFY_FAIL", raising=False)
 
@@ -42,6 +46,26 @@ def test_parse_wrap_mismatch_into_failure_evidence() -> None:
     assert evidence.expected == "55"
     assert evidence.observed == "33"
     assert evidence.cycle is None
+
+
+def test_parse_ai_generated_failure_protocol() -> None:
+    result = tool_adapter.rebuild_tool_result(
+        tool="vvp",
+        mode="live",
+        status=STATUS_VERIFICATION_FAILED,
+        exit_code=1,
+        stdout=(
+            "JACVERIFY_FAILURE kind=SUM_MISMATCH "
+            "expected=0a observed=09 cycle=7\n"
+        ),
+    )
+    evidence = parse_failure_evidence(result)
+
+    assert evidence is not None
+    assert evidence.kind == "SUM_MISMATCH"
+    assert evidence.expected == "0a"
+    assert evidence.observed == "09"
+    assert evidence.cycle == 7
 
 
 def test_mock_stage_statuses_and_llm_wrappers(tmp_path: Path) -> None:
@@ -233,15 +257,150 @@ def test_design_and_spec_uploads_generate_a_testbench(tmp_path: Path) -> None:
         "adder_spec.md",
         generic_spec,
     )
+    generated = generate_testbench_for_run(
+        str(workspace),
+        str(tmp_path),
+        paths.design_path,
+        paths.spec_path,
+    )
 
     assert curated.accepted and curated.case_id == "fifo"
     assert generic.accepted and generic.case_id == "uploaded"
     assert Path(paths.design_path).read_text(encoding="utf-8") == generic_design
     assert Path(paths.spec_path).read_text(encoding="utf-8") == generic_spec
-    assert "module tb_wrap" in Path(paths.test_path).read_text(encoding="utf-8")
-    assert Path(paths.test_path).name == "generated_tb_wrap.sv"
+    assert paths.test_path == ""
+    assert "module tb_wrap" in Path(generated.path).read_text(encoding="utf-8")
+    assert generated.filename == "generated_tb_wrap.sv"
+    assert generated.mode == "hardcoded"
     assert paths.design_module == "adder"
-    assert paths.test_module == "tb_wrap"
+    assert paths.test_module == ""
+
+
+def test_ai_testgen_writes_typed_firecrawl_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    paths = materialize_uploaded_inputs(
+        str(workspace),
+        str(tmp_path),
+        "adder.sv",
+        "module adder; endmodule\n",
+        "adder_spec.md",
+        "# Adder\nThe design must elaborate.\n",
+    )
+    monkeypatch.setenv("JACVERIFY_AI_TESTGEN", "1")
+    monkeypatch.setenv("JACVERIFY_MOCK_LLM", "0")
+    monkeypatch.setenv("JACVERIFY_LLM_BACKEND", "firecrawl")
+    monkeypatch.setattr(
+        tool_adapter,
+        "_firecrawl_agent",
+        lambda **_: {
+            "testbench": (
+                "```systemverilog\n"
+                "module generated_adder_test;\n"
+                "  adder dut();\n"
+                "  initial begin\n"
+                '    $display("JACVERIFY_TEST_PASS");\n'
+                "    $finish;\n"
+                "  end\n"
+                "endmodule\n"
+                "```"
+            ),
+            "notes": "Bounded elaboration test.",
+        },
+    )
+
+    generated = generate_testbench_for_run(
+        str(workspace),
+        str(tmp_path),
+        paths.design_path,
+        paths.spec_path,
+    )
+
+    assert generated.mode == "ai:firecrawl"
+    assert generated.filename == "generated_ai_testbench.sv"
+    assert generated.module_name == "generated_adder_test"
+    assert "```" not in Path(generated.path).read_text(encoding="utf-8")
+
+
+def test_ai_testgen_repairs_compile_error_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    paths = materialize_uploaded_inputs(
+        str(workspace),
+        str(tmp_path),
+        "adder.sv",
+        "module adder; endmodule\n",
+        "adder_spec.md",
+        "# Adder\nThe design must elaborate.\n",
+    )
+    monkeypatch.setenv("JACVERIFY_AI_TESTGEN", "1")
+    monkeypatch.setenv("JACVERIFY_MOCK_LLM", "0")
+    monkeypatch.setenv("JACVERIFY_MOCK_TOOLS", "0")
+    monkeypatch.setenv("JACVERIFY_AI_TESTGEN_REPAIR_ATTEMPTS", "1")
+    responses = iter(
+        [
+            {
+                "testbench": "module tb_adder; initial { $finish; } endmodule",
+                "notes": "initial draft",
+            },
+            {
+                "testbench": (
+                    "module tb_adder;\n"
+                    "  initial begin\n"
+                    '    $display("JACVERIFY_TEST_PASS");\n'
+                    "    $finish;\n"
+                    "  end\n"
+                    "endmodule\n"
+                ),
+                "notes": "repaired draft",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        tool_adapter,
+        "_firecrawl_agent",
+        lambda **_: next(responses),
+    )
+    compile_calls = 0
+
+    def fake_lint(*_: object) -> tool_adapter.ToolResult:
+        nonlocal compile_calls
+        compile_calls += 1
+        if compile_calls == 1:
+            return tool_adapter.ToolResult(
+                "iverilog",
+                "live",
+                tool_adapter.STATUS_TOOL_ERROR,
+                2,
+                ["iverilog"],
+                1,
+                "",
+                "line 1: syntax error",
+            )
+        return tool_adapter.ToolResult(
+            "iverilog",
+            "live",
+            tool_adapter.STATUS_PASSED,
+            0,
+            ["iverilog"],
+            1,
+            "",
+            "",
+        )
+
+    monkeypatch.setattr(tool_adapter, "lint_compile", fake_lint)
+    generated = generate_testbench_for_run(
+        str(workspace),
+        str(tmp_path),
+        paths.design_path,
+        paths.spec_path,
+    )
+
+    assert compile_calls == 2
+    assert "initial begin" in Path(generated.path).read_text(encoding="utf-8")
+    assert "Auto-repaired" in generated.notes
 
 
 def test_coverage_marker_is_parsed_from_test_output(tmp_path: Path) -> None:
@@ -252,3 +411,78 @@ def test_coverage_marker_is_parsed_from_test_output(tmp_path: Path) -> None:
     assert coverage.code_coverage == 72.5
     assert coverage.functional_coverage == 66.7
     assert coverage.source == "mock:testbench_marker"
+
+
+def test_background_llm_job_starts_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    draft = tool_adapter.HypothesisDraft(1, "counter wrap", 0.9, "test wrap")
+    artifact = tool_adapter.ArtifactDraft(
+        "directed_test",
+        "exercise counter wrap",
+        "demo/fifo/fifo_fixed.sv",
+        "fixture",
+        draft.claim,
+        "test artifact",
+    )
+
+    def slow_generate(*_: object) -> tool_adapter.ArtifactDraft:
+        assert release.wait(timeout=2)
+        return artifact
+
+    monkeypatch.setattr(tool_adapter, "generate_artifact", slow_generate)
+    started_at = time.monotonic()
+    job_id = tool_adapter.start_artifact_generation_job(draft, "fifo")
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert tool_adapter.poll_llm_job(job_id).status in {"queued", "running"}
+    release.set()
+    deadline = time.monotonic() + 2
+    status = tool_adapter.poll_llm_job(job_id)
+    while status.status != "completed" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = tool_adapter.poll_llm_job(job_id)
+
+    assert status.status == "completed"
+    assert status.artifact == artifact
+    tool_adapter.discard_llm_job(job_id)
+
+
+def test_background_llm_job_retries_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    draft = tool_adapter.HypothesisDraft(1, "counter wrap", 0.9, "test wrap")
+    artifact = tool_adapter.ArtifactDraft(
+        "directed_test",
+        "exercise counter wrap",
+        "demo/fifo/fifo_fixed.sv",
+        "fixture",
+        draft.claim,
+        "test artifact",
+    )
+
+    def flaky_generate(*_: object) -> tool_adapter.ArtifactDraft:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("model exceeded 45s")
+        return artifact
+
+    monkeypatch.setenv("JACVERIFY_LLM_RETRIES", "1")
+    monkeypatch.setenv("JACVERIFY_LLM_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setattr(tool_adapter, "generate_artifact", flaky_generate)
+    job_id = tool_adapter.start_artifact_generation_job(draft, "fifo")
+    deadline = time.monotonic() + 2
+    status = tool_adapter.poll_llm_job(job_id)
+    while status.status not in {"completed", "failed"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = tool_adapter.poll_llm_job(job_id)
+
+    assert status.status == "completed"
+    assert status.attempt == 2
+    assert status.max_attempts == 2
+    assert calls == 2
+    tool_adapter.discard_llm_job(job_id)
