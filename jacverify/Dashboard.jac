@@ -111,11 +111,12 @@ def:pub Dashboard -> JsxElement {
     return <div className="app-shell">
         <header className="topbar">
             <div className="brand-lockup">
-                <div className="brand-mark">JV</div>
-                <div>
-                    <div className="brand-name">JacVerify</div>
-                    <div className="brand-subtitle">Evidence-driven verification loop</div>
-                </div>
+                <div
+                    className="brand-logo"
+                    role="img"
+                    aria-label="JacVerify"
+                ></div>
+                <div className="brand-subtitle">Evidence-driven verification loop</div>
             </div>
             <div className="topbar-actions">
                 <span className="live-dot"></span>
@@ -279,8 +280,11 @@ def:pub Dashboard -> JsxElement {
                         <div className="empty-icon">⬆</div>
                         <h3>Upload a design and specification to begin</h3>
                         <p>
-                            JacVerify generates the testbench in hardcoded or AI mode. For the
-                            reviewed FIFO example, click <strong>Use curated sample</strong>.
+                            JacVerify generates the testbench in hardcoded or AI mode.
+                            Curated fixtures:
+                            <code>demo/fifo</code>, <code>demo/alu</code>,
+                            <code>demo/shift_reg</code>. Or click
+                            <strong>Use curated sample</strong> for the FIFO pair.
                         </p>
                     </div>
                 } else {

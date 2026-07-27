@@ -144,7 +144,7 @@ test "walker pipeline reaches DONE with generated-test evidence" {
     assert first_run.uploaded_spec_filename == "fifo_spec.md";
     assert first_run.uploaded_test_filename == "generated_tb_wrap.sv";
     assert first_run.test_generation_mode == "hardcoded";
-    assert first_run.test_generation_source == "hardcoded";
+    assert first_run.test_generation_source == "hardcoded:fifo";
     assert first_run.coverage_available;
     assert first_run.code_coverage == 91.0;
     assert first_run.functional_coverage == 100.0;

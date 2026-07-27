@@ -13,12 +13,14 @@ import from jacverify.tool_adapter {
     ToolResult,
     UploadMatch,
     UploadedInputPaths,
+    allowlisted_candidate_path,
     coverage_from_result,
     discard_llm_job,
     fresh_run_id,
     generate_artifact,
     generate_testbench_for_run,
     identify_uploaded_inputs,
+    is_curated_case_id,
     lint_compile,
     llm_backend,
     llm_mode,
@@ -36,6 +38,7 @@ import from jacverify.tool_adapter {
     start_hypothesis_ranking_job,
     start_testbench_generation_job,
     testgen_mode,
+    set_active_case,
     tools_mode
 }
 import from jacverify.llm_calls {
@@ -811,6 +814,12 @@ def create_case_run(
     spec_content: str
 ) -> Run {
     workspace_root = os.getcwd();
+    if is_curated_case_id(case_id) {
+        set_active_case(case_id);
+    } else {
+        # Generic uploads keep the FIFO prototype tooling defaults.
+        set_active_case("fifo");
+    }
     run_id = new_run_id();
     output_dir = os.path.join(workspace_root, "runs", run_id);
     inputs: UploadedInputPaths = materialize_uploaded_inputs(
@@ -843,7 +852,7 @@ def create_case_run(
         module_path=inputs.design_path,
         testbench_name="",
         test_generation_mode=testgen_mode(),
-        reviewed_candidate_available=case_id == "fifo"
+        reviewed_candidate_available=is_curated_case_id(case_id)
     );
     return run;
 }
@@ -998,14 +1007,15 @@ def generate_artifact_for_run(
         next_action=hypothesis.next_action
     );
     proposal: ArtifactProposalOutput = propose_fifo_artifact(context, top);
+    candidate = allowlisted_candidate_path();
     return make_artifact_draft(
         kind="llm_reviewed_candidate_proposal",
         description=(
             f"{proposal.description} Verification goal: "
             f"{proposal.verification_goal}"
         ),
-        candidate_path="demo/fifo/fifo_fixed.sv",
-        candidate_label="allowlisted_fixture:fifo_fixed.sv",
+        candidate_path=candidate,
+        candidate_label="allowlisted_fixture:" + os.path.basename(candidate),
         hypothesis_claim=hypothesis.claim,
         notes=(
             f"{proposal.rationale} The model cannot choose or write the RTL "
@@ -2213,7 +2223,10 @@ def:pub preview_uploaded_inputs(
             (
                 "AI test generation is enabled through the live Firecrawl backend."
                 if testgen_mode() == "ai"
-                else "Hardcoded FIFO test generation is enabled."
+                else (
+                    "Matched curated cases use their reviewed directed "
+                    "testbench; generic uploads use the FIFO prototype."
+                )
             )
             + " Automatic repair remains limited to reviewed fixtures."
         )
