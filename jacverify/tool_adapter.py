@@ -15,6 +15,33 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+
+def _load_dotenv_file(path: Path) -> None:
+    """Load KEY=VALUE pairs into os.environ without overriding existing values.
+
+    Jac microservice store workers do not always inherit a sourced shell `.env`,
+    so the adapter loads the project-root file itself when present.
+    """
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+# Prefer CWD (jac start project root); fall back to repo root next to jacverify/.
+_load_dotenv_file(Path.cwd() / ".env")
+_load_dotenv_file(Path(__file__).resolve().parents[1] / ".env")
+
 STATUS_PASSED = "PASSED"
 STATUS_VERIFICATION_FAILED = "VERIFICATION_FAILED"
 STATUS_TOOL_ERROR = "TOOL_ERROR"

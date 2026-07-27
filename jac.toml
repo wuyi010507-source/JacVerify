@@ -7,6 +7,7 @@ kind = "web-app"
 jac-version = "==0.34.7"
 
 [dependencies]
+byllm = "~=0.6"
 
 [dependencies.npm]
 react = "^18.2.0"
@@ -34,9 +35,15 @@ port = 8000
 [test]
 verbose = true
 
+[byllm.model]
+default_model = "gpt-4o-mini"
+
 [byllm.call_params]
 temperature = 0.1
 max_output_retries = 2
+
+[byllm.litellm]
+drop_params = true
 
 [client.app_meta_data]
 title = "JacVerify"
