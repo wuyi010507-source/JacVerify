@@ -99,7 +99,8 @@ def:pub Dashboard -> JsxElement {
         spec_content: str = "",
         upload_preview: UploadPreview | None = None,
         reading_upload: bool = False,
-        curated_session: bool = False;
+        curated_session: bool = False,
+        workflow_started: bool = False;
 
     async def run_demo;
     async def use_curated_sample;
@@ -126,7 +127,7 @@ def:pub Dashboard -> JsxElement {
         </header>
 
         <main>
-            <section className="hero">
+            <section className={"hero workflow-intro " + ("is-collapsed" if workflow_started else "")}>
                 <div>
                     <div className="eyebrow">VERIFICATION WORKFLOW</div>
                     <h1>Upload a design. Prove it with evidence.</h1>
@@ -149,7 +150,7 @@ def:pub Dashboard -> JsxElement {
             }}
 
             <section className="view-stack">
-                <div className="task-hero">
+                <div className={"task-hero workflow-intro " + ("is-collapsed" if workflow_started else "")}>
                     <div>
                         <div className="eyebrow">EIGHT-WALKER EVIDENCE LOOP</div>
                         <h2>Verify a design from its specification</h2>
@@ -597,10 +598,71 @@ def:pub Dashboard -> JsxElement {
                                             <span key={evidence_id} className="evidence-chip">{evidence_id}</span>
                                         }}
                                     </div>
+                                    {if transition.code_change_content {
+                                        <details className="code-change-details">
+                                            <summary>
+                                                <span>View code change</span>
+                                                <span className="code-change-chevron">⌄</span>
+                                            </summary>
+                                            <div className="code-change-panel">
+                                                <div className="code-change-title">
+                                                    {transition.code_change_title}
+                                                </div>
+                                                <pre><code>{transition.code_change_content}</code></pre>
+                                            </div>
+                                        </details>
+                                    }}
                                 </div>
                             </article>
                         }}
                     </div>
+
+                    if demo_run.status != "running" and demo_run.output_files {
+                        <section className="output-files-panel">
+                            <div className="output-files-heading">
+                                <div>
+                                    <div className="eyebrow">RUN ARTIFACTS</div>
+                                    <h3>Output Files</h3>
+                                    <p>
+                                        Generated files from this verification run.
+                                        Review the source or download a local copy.
+                                    </p>
+                                </div>
+                                <span>{len(demo_run.output_files)} FILES</span>
+                            </div>
+                            <div className="output-files-list">
+                                {for output in demo_run.output_files {
+                                    <article key={output.filename} className="output-file-card">
+                                        <div className="output-file-meta">
+                                            <div>
+                                                <span>{output.kind}</span>
+                                                <strong>{output.filename}</strong>
+                                                <small>
+                                                    {output.relative_path} · {output.size_bytes} bytes
+                                                </small>
+                                            </div>
+                                        </div>
+                                        <details className="output-file-details">
+                                            <summary>View</summary>
+                                            <div className="code-change-panel output-code-panel">
+                                                <div className="code-change-title">
+                                                    {output.filename}
+                                                </div>
+                                                <pre><code>{output.content}</code></pre>
+                                            </div>
+                                        </details>
+                                        <a
+                                            className="output-download"
+                                            href={output.download_href}
+                                            download={output.filename}
+                                        >
+                                            Download
+                                        </a>
+                                    </article>
+                                }}
+                            </div>
+                        </section>
+                    }
                 }}
             </section>
         </main>

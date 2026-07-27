@@ -7,6 +7,7 @@ impl Dashboard.run_demo {
         );
         return;
     }
+    workflow_started = True;
     running = True;
     error_message = "";
     try {
@@ -36,6 +37,7 @@ impl Dashboard.run_demo {
 }
 
 impl Dashboard.use_curated_sample {
+    workflow_started = True;
     running = True;
     error_message = "";
     reading_upload = False;
@@ -76,6 +78,7 @@ impl Dashboard.on_design_file_change(e: any) {
     error_message = "";
     demo_run = None;
     curated_session = False;
+    workflow_started = False;
     try {
         file_list = e.target.files;
         if file_list is None or file_list.length == 0 {
@@ -114,6 +117,7 @@ impl Dashboard.on_spec_file_change(e: any) {
     error_message = "";
     demo_run = None;
     curated_session = False;
+    workflow_started = False;
     try {
         file_list = e.target.files;
         if file_list is None or file_list.length == 0 {
@@ -154,6 +158,7 @@ impl Dashboard.clear_design(_e: MouseEvent) {
     demo_run = None;
     error_message = "";
     curated_session = False;
+    workflow_started = False;
 }
 
 impl Dashboard.clear_spec(_e: MouseEvent) {
@@ -163,4 +168,5 @@ impl Dashboard.clear_spec(_e: MouseEvent) {
     demo_run = None;
     error_message = "";
     curated_session = False;
+    workflow_started = False;
 }

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import difflib
 import json
 import os
 import re
@@ -2171,6 +2173,55 @@ def identify_uploaded_inputs(
 
 def read_text_file(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
+
+
+def render_code_diff(
+    before_path: str,
+    after_path: str,
+    before_label: str = "before",
+    after_label: str = "after",
+) -> str:
+    """Return a unified diff suitable for display in the verification timeline."""
+    before = Path(before_path).read_text(encoding="utf-8").splitlines()
+    after = Path(after_path).read_text(encoding="utf-8").splitlines()
+    return "\n".join(
+        difflib.unified_diff(
+            before,
+            after,
+            fromfile=before_label,
+            tofile=after_label,
+            lineterm="",
+        )
+    )
+
+
+def publish_candidate_output(
+    workspace_root: str,
+    output_dir: str,
+    candidate_path: str,
+) -> str:
+    """Copy an allow-listed reviewed candidate into this run's output folder."""
+    workspace = Path(workspace_root).resolve()
+    source = (
+        Path(candidate_path).resolve()
+        if Path(candidate_path).is_absolute()
+        else (workspace / candidate_path).resolve()
+    )
+    if source != workspace and workspace not in source.parents:
+        raise ValueError("Candidate output must stay inside the workspace")
+    if not source.is_file():
+        raise FileNotFoundError(f"Candidate output does not exist: {source}")
+    destination_dir = Path(output_dir).resolve() / "outputs"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    shutil.copy2(source, destination)
+    return str(destination)
+
+
+def text_file_data_url(path: str) -> str:
+    """Encode a run-local text artifact as a browser-downloadable data URL."""
+    encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    return f"data:text/plain;charset=utf-8;base64,{encoded}"
 
 
 def load_curated_case_upload(

@@ -29,8 +29,10 @@ import from jacverify.tool_adapter {
     make_artifact_draft,
     make_hypothesis_draft,
     read_text_file,
+    render_code_diff,
     parse_failure_from_stored,
     poll_llm_job,
+    publish_candidate_output,
     rank_hypotheses,
     run_reverify,
     run_uploaded_test,
@@ -38,6 +40,7 @@ import from jacverify.tool_adapter {
     start_hypothesis_ranking_job,
     start_testbench_generation_job,
     testgen_mode,
+    text_file_data_url,
     set_active_case,
     tools_mode
 }
@@ -144,6 +147,7 @@ node Run {
         artifact_description: str = "",
         candidate_label: str = "",
         candidate_path: str = "",
+        candidate_output_path: str = "",
         candidate_applied: bool = False,
         reverify_status: str = "NOT_RUN",
         reverify_stdout: str = "",
@@ -225,7 +229,9 @@ node TransitionRecord {
         summary: str,
         evidence_kind: str,
         evidence_ids: list[str],
-        walker_name: str = "";
+        walker_name: str = "",
+        code_change_title: str = "",
+        code_change_content: str = "";
 }
 
 edge HasTransition: Run --> TransitionRecord {}
@@ -274,7 +280,18 @@ obj TransitionView {
         summary: str,
         evidence_kind: str,
         evidence_ids: list[str],
-        walker_name: str = "";
+        walker_name: str = "",
+        code_change_title: str = "",
+        code_change_content: str = "";
+}
+
+obj OutputFileView {
+    has filename: str,
+        kind: str,
+        relative_path: str,
+        size_bytes: int,
+        content: str,
+        download_href: str;
 }
 
 obj DashboardData {
@@ -338,7 +355,8 @@ obj DemoRunResult {
         code_coverage: float = 0.0,
         functional_coverage: float = 0.0,
         coverage_source: str = "not_reported",
-        upload_accepted: bool = False;
+        upload_accepted: bool = False,
+        output_files: list[OutputFileView] = [];
 }
 
 obj UploadPreview {
@@ -623,7 +641,9 @@ def append_transition(
     summary: str,
     evidence_kind: str,
     evidence_ids: list[str],
-    walker_name: str
+    walker_name: str,
+    code_change_title: str = "",
+    code_change_content: str = ""
 ) -> TransitionView {
     sequence = len([run ->:HasTransition:->]) + 1;
     run +>:HasTransition:+> TransitionRecord(
@@ -634,7 +654,9 @@ def append_transition(
         summary=summary,
         evidence_kind=evidence_kind,
         evidence_ids=evidence_ids,
-        walker_name=walker_name
+        walker_name=walker_name,
+        code_change_title=code_change_title,
+        code_change_content=code_change_content
     );
     run.current_state = to_state;
     if not run.walker_log or run.walker_log[-1] != walker_name {
@@ -648,7 +670,9 @@ def append_transition(
         summary=summary,
         evidence_kind=evidence_kind,
         evidence_ids=evidence_ids,
-        walker_name=walker_name
+        walker_name=walker_name,
+        code_change_title=code_change_title,
+        code_change_content=code_change_content
     );
 }
 
@@ -702,10 +726,50 @@ def list_run_transitions(run: Run) -> list[TransitionView] {
             summary=record.summary,
             evidence_kind=record.evidence_kind,
             evidence_ids=record.evidence_ids,
-            walker_name=record.walker_name
+            walker_name=record.walker_name,
+            code_change_title=record.code_change_title,
+            code_change_content=record.code_change_content
         )
         for record in records
     ];
+}
+
+def build_output_files(run: Run) -> list[OutputFileView] {
+    files: list[OutputFileView] = [];
+    if run.input_test_path and os.path.isfile(run.input_test_path) {
+        files.append(
+            OutputFileView(
+                filename=os.path.basename(run.input_test_path),
+                kind="GENERATED TESTBENCH",
+                relative_path=os.path.relpath(
+                    run.input_test_path,
+                    run.output_dir
+                ),
+                size_bytes=os.path.getsize(run.input_test_path),
+                content=read_text_file(run.input_test_path),
+                download_href=text_file_data_url(run.input_test_path)
+            )
+        );
+    }
+    if (
+        run.candidate_output_path
+        and os.path.isfile(run.candidate_output_path)
+    ) {
+        files.append(
+            OutputFileView(
+                filename=os.path.basename(run.candidate_output_path),
+                kind="REPAIRED RTL",
+                relative_path=os.path.relpath(
+                    run.candidate_output_path,
+                    run.output_dir
+                ),
+                size_bytes=os.path.getsize(run.candidate_output_path),
+                content=read_text_file(run.candidate_output_path),
+                download_href=text_file_data_url(run.candidate_output_path)
+            )
+        );
+    }
+    return files;
 }
 
 def build_demo_result(run: Run) -> DemoRunResult {
@@ -776,7 +840,8 @@ def build_demo_result(run: Run) -> DemoRunResult {
         code_coverage=run.code_coverage,
         functional_coverage=run.functional_coverage,
         coverage_source=run.coverage_source,
-        upload_accepted=run.case_id != ""
+        upload_accepted=run.case_id != "",
+        output_files=build_output_files(run)
     );
 }
 
@@ -1196,7 +1261,9 @@ walker GenerateTestbenchWalker {
                     f"test:{generated.path}",
                     f"testgen:{generated.mode}"
                 ],
-                "GenerateTestbenchWalker"
+                "GenerateTestbenchWalker",
+                "Generated testbench · " + generated.filename,
+                read_text_file(generated.path)
             );
         } except Exception as exc {
             block_run(
@@ -1806,6 +1873,20 @@ walker GenerateArtifactWalker {
             here.artifact_description = artifact_draft.description;
             here.candidate_label = artifact_draft.candidate_label;
             here.candidate_path = artifact_draft.candidate_path;
+            candidate_file_path: str = (
+                artifact_draft.candidate_path
+                if os.path.isabs(artifact_draft.candidate_path)
+                else os.path.join(
+                    here.workspace_root,
+                    artifact_draft.candidate_path
+                )
+            );
+            code_change: str = render_code_diff(
+                here.input_design_path,
+                candidate_file_path,
+                os.path.basename(here.input_design_path),
+                os.path.basename(candidate_file_path)
+            );
             top +>:Produces:+> Artifact(
                 kind=artifact_draft.kind,
                 description=artifact_draft.description,
@@ -1829,7 +1910,13 @@ walker GenerateArtifactWalker {
                     f"attempt:{here.debug_attempt}",
                     f"hypothesis:rank-{top.rank}"
                 ],
-                "GenerateArtifactWalker"
+                "GenerateArtifactWalker",
+                "RTL candidate diff · " + artifact_draft.candidate_label,
+                (
+                    code_change
+                    if code_change
+                    else read_text_file(candidate_file_path)
+                )
             );
         } except Exception as exc {
             request_user_review(
@@ -1915,7 +2002,12 @@ walker ReverifyAndRenderWalker {
         }
         artifact_node = artifacts[0];
 
-        # Explicit reviewed-candidate application event (fixture, not auto RTL rewrite).
+        # Publish the reviewed candidate as a run-local output before applying it.
+        here.candidate_output_path = publish_candidate_output(
+            here.workspace_root,
+            here.output_dir,
+            here.candidate_path
+        );
         here.candidate_applied = True;
         append_transition(
             here,
@@ -1924,7 +2016,11 @@ walker ReverifyAndRenderWalker {
             "reviewed_candidate_applied",
             f"Applied reviewed candidate fixture {here.candidate_label}.",
             "action_recommendation",
-            [here.candidate_label, here.candidate_path],
+            [
+                here.candidate_label,
+                here.candidate_path,
+                here.candidate_output_path
+            ],
             "ReverifyAndRenderWalker"
         );
 

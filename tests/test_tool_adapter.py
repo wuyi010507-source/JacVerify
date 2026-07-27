@@ -21,12 +21,15 @@ from jacverify.tool_adapter import (
     load_spec,
     materialize_uploaded_inputs,
     parse_failure_evidence,
+    publish_candidate_output,
     rank_hypotheses,
+    render_code_diff,
     run_fifo_suite,
     run_reverify,
     run_smoke,
     run_wrap_regression,
     set_active_case,
+    text_file_data_url,
 )
 
 
@@ -68,6 +71,61 @@ def test_parse_ai_generated_failure_protocol() -> None:
     assert evidence.expected == "0a"
     assert evidence.observed == "09"
     assert evidence.cycle == 7
+
+
+def test_render_code_diff_returns_named_unified_diff(tmp_path: Path) -> None:
+    before = tmp_path / "buggy.sv"
+    after = tmp_path / "fixed.sv"
+    before.write_text("module fifo;\nassign full = 0;\nendmodule\n", encoding="utf-8")
+    after.write_text("module fifo;\nassign full = count == 4;\nendmodule\n", encoding="utf-8")
+
+    diff = render_code_diff(
+        str(before),
+        str(after),
+        "fifo_buggy.sv",
+        "fifo_fixed.sv",
+    )
+
+    assert "--- fifo_buggy.sv" in diff
+    assert "+++ fifo_fixed.sv" in diff
+    assert "-assign full = 0;" in diff
+    assert "+assign full = count == 4;" in diff
+
+
+def test_publish_candidate_output_copies_allowlisted_file(tmp_path: Path) -> None:
+    workspace = Path(__file__).resolve().parents[1]
+
+    published = Path(
+        publish_candidate_output(
+            str(workspace),
+            str(tmp_path),
+            "demo/fifo/fifo_fixed.sv",
+        )
+    )
+
+    assert published == tmp_path / "outputs" / "fifo_fixed.sv"
+    assert published.read_text(encoding="utf-8") == (
+        workspace / "demo" / "fifo" / "fifo_fixed.sv"
+    ).read_text(encoding="utf-8")
+    assert text_file_data_url(str(published)).startswith(
+        "data:text/plain;charset=utf-8;base64,"
+    )
+
+
+def test_publish_candidate_output_rejects_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.sv"
+    outside.write_text("module outside; endmodule\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inside the workspace"):
+        publish_candidate_output(
+            str(workspace),
+            str(tmp_path / "run"),
+            str(outside),
+        )
 
 
 def test_mock_stage_statuses_and_llm_wrappers(tmp_path: Path) -> None:

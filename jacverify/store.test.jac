@@ -153,6 +153,14 @@ test "walker pipeline reaches DONE with generated-test evidence" {
     assert first_run.tool_evidence_available;
     assert "WRAP_MISMATCH" in first_run.regression_output;
     assert "WRAP_TEST_PASS" in first_run.reverify_output;
+    assert len(first_run.output_files) == 2;
+    assert first_run.output_files[0].kind == "GENERATED TESTBENCH";
+    assert first_run.output_files[0].filename == "generated_tb_wrap.sv";
+    assert first_run.output_files[0].download_href.startswith("data:text/plain");
+    assert first_run.output_files[1].kind == "REPAIRED RTL";
+    assert first_run.output_files[1].filename == "fifo_fixed.sv";
+    assert first_run.output_files[1].relative_path == "outputs/fifo_fixed.sv";
+    assert "module fifo" in first_run.output_files[1].content;
 
     expected_walkers = [
         "LoadInputsWalker",
@@ -173,10 +181,23 @@ test "walker pipeline reaches DONE with generated-test evidence" {
     for name in expected_walkers {
         assert name in walker_names;
     }
+    code_transitions = [
+        transition
+        for transition in first_run.transitions
+        if transition.code_change_content
+    ];
+    assert len(code_transitions) == 2;
+    assert code_transitions[0].event == "testbench_generated";
+    assert "module tb_wrap" in code_transitions[0].code_change_content;
+    assert code_transitions[1].event == "artifact_generated";
+    assert "--- fifo_buggy.sv" in code_transitions[1].code_change_content;
+    assert "+++ fifo_fixed.sv" in code_transitions[1].code_change_content;
 
     runs: list[Run] = [root -->[?:Run, run_id == first_run.job_id]];
     assert len(runs) == 1;
     run = runs[0];
+    assert os.path.isfile(run.candidate_output_path);
+    assert run.candidate_output_path.endswith("outputs/fifo_fixed.sv");
     assert len([run ->:OwnsRequirement:->]) == 5;
     assert len([run ->:OwnsModule:->]) == 1;
     executed_tests: list[Test] = [run ->:Executes:->];
